@@ -33,19 +33,32 @@ This is the critical workflow. Follow these steps EVERY TIME:
 5. authenticated_fetch(url, method, headers: {...}) — replay the request with the exact headers you found in step 4
 6. create_tool(...) — once you have a working request, wrap it into a permanent tool so you never repeat this discovery
 
-## IMPORTANT: authenticated_fetch requires correct headers
-Websites use CSRF tokens and custom headers. You MUST inspect the real request via network_request_detail to see what headers are required. Just calling authenticated_fetch without the right headers will fail with 403/CSRF errors. The headers are in the captured request — copy them.
+## IMPORTANT: authenticated_fetch vs fetch in create_tool
+- authenticated_fetch goes through the browser extension — carries the page's cookies automatically but you CAN'T control CSRF headers (many sites will reject with 403)
+- In create_tool code, use fetch() directly with helpers.credentials() to set cookies and CSRF headers explicitly. This is more reliable.
+
+Example — the RIGHT way to call LinkedIn's API in a custom tool:
+  const creds = helpers.credentials("linkedin");
+  const res = await fetch(url, {
+    headers: {
+      "Cookie": "li_at=" + creds.li_at + "; JSESSIONID=\\"" + creds.jsessionid + "\\"",
+      "csrf-token": creds.jsessionid,
+      "x-restli-protocol-version": "2.0.0",
+    }
+  });
+
+Use network_request_detail to discover what headers a site needs, then replicate them with fetch() + helpers.credentials() in create_tool.
 
 ## create_tool
 Creates a REAL MCP tool available immediately (no restart needed). The AI writes JavaScript that runs with:
 - params — tool input parameters
-- helpers.credentials(service) — stored auth tokens
-- helpers.browserFetch(url, opts) — request from browser context
+- helpers.credentials(service) — stored auth tokens (from extract_auth)
+- helpers.browserFetch(url, opts) — request from browser context (auto cookies, no custom headers)
 - helpers.store(service, key, val) — store a credential
 - helpers.query(collection, opts) / helpers.insert(collection, data) — SQLite collections
-- fetch — standard fetch for direct HTTP calls
+- fetch — standard fetch (YOU control all headers, cookies, body — use this for API calls)
 
-Always create_tool after you get a working authenticated_fetch pattern. This saves the user from waiting for rediscovery next time.`;
+Always create_tool after you get a working pattern. This saves the user from waiting for rediscovery next time.`;
 const server = new McpServer({ name: "neo", version: "1.0.0" }, { instructions: NEO_INSTRUCTIONS });
 // ── Helpers ──────────────────────────────────────────────────────────────────
 function json(obj) {
