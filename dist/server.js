@@ -378,6 +378,23 @@ Example — creating a Notion integration:
     await server.server.sendToolListChanged();
     return { content: [{ type: "text", text: `Tool "${name}" created and registered. Available immediately.` }] };
 });
+server.tool("update_tool", "Update an existing custom tool's description, parameters, or code.", {
+    name: z.string().describe("Tool name to update"),
+    description: z.string().optional(),
+    params_schema: z.record(z.string(), z.string()).optional(),
+    code: z.string().optional(),
+}, async ({ name, description, params_schema, code }) => {
+    const existing = db.getCustomTool(name);
+    if (!existing)
+        return { content: [{ type: "text", text: `Tool "${name}" not found.` }] };
+    const newDesc = description || existing.description;
+    const newSchema = params_schema || JSON.parse(existing.params_schema);
+    const newCode = code || existing.code;
+    db.saveCustomTool(name, newDesc, newSchema, newCode, existing.service || undefined);
+    registerDynamicTool(name, newDesc, newSchema, newCode);
+    await server.server.sendToolListChanged();
+    return { content: [{ type: "text", text: `Tool "${name}" updated. Changes active immediately.` }] };
+});
 server.tool("list_custom_tools", "List all custom tools that have been created.", {}, async () => {
     const tools = db.getCustomTools();
     if (tools.length === 0)
