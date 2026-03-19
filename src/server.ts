@@ -18,29 +18,36 @@ import * as twitter from "./integrations/twitter.js";
 import * as db from "./db.js";
 import { browserCommand, startBridge, isBridgeConnected } from "./bridge.js";
 
-const NEO_INSTRUCTIONS = `Neo is a browser bridge that lets you operate the user's real accounts. You can read their LinkedIn, post tweets, send WhatsApp messages, and interact with ANY website they're logged into — all through their actual browser session. No API keys needed. You extract auth tokens from the browser once, then make direct API calls.
+const NEO_INSTRUCTIONS = `Neo is a browser bridge that lets you operate the user's real accounts — LinkedIn, Twitter/X, WhatsApp, and ANY website they're logged into. No API keys needed.
 
-You're not limited to pre-built integrations. If the user asks you to connect to a service Neo doesn't have tools for, you can discover its API, build tools for it, and register them permanently — all at runtime.
+## Built-in services
+- LinkedIn: extract_auth("linkedin") once, then use linkedin_* tools
+- Twitter/X: extract_auth("twitter") once, then use twitter_* tools
+- WhatsApp: whatsapp_connect (QR code first time, auto-reconnects after)
 
-## First-time setup for a service
-1. Call extract_auth with the service name (e.g. "linkedin") — this grabs auth tokens from the user's browser
-2. Then use the service's tools normally (linkedin_my_posts, twitter_user_tweets, etc.)
-3. Tokens are stored permanently — you only need to extract once
+## When a built-in tool doesn't exist for what the user wants
+This is the critical workflow. Follow these steps EVERY TIME:
 
-## For services without built-in tools
-Use the meta-tools to build integrations on the fly:
-1. extract_auth("servicename") — grab tokens
-2. discover_api(start, navigate: "site.com") — capture network traffic
-3. discover_api(list) — see all API endpoints the site uses
-4. authenticated_fetch(url) — call endpoints as the logged-in user
-5. create_tool(...) — write a reusable tool with JavaScript so you don't repeat this next time
+1. extract_auth("servicename") — grab auth tokens from the browser
+2. network_capture(action: "start", navigate: "https://the-site.com/relevant-page") — start capturing network traffic and navigate to the page
+3. network_requests() — list all API calls the page made (you'll see the internal API endpoints)
+4. network_request_detail(id: "...") — pick the relevant request and inspect its FULL headers (you need these for CSRF tokens, auth headers, content-type, etc.)
+5. authenticated_fetch(url, method, headers: {...}) — replay the request with the exact headers you found in step 4
+6. create_tool(...) — once you have a working request, wrap it into a permanent tool so you never repeat this discovery
 
-## Key points
-- LinkedIn and Twitter tokens work for direct API calls — no browser needed after extraction
-- Twitter query IDs are extracted at runtime from their JS bundle (they rotate constantly)
-- WhatsApp needs whatsapp_connect first (QR code scan on first use, auto-reconnects after)
-- create_tool makes REAL tools that persist across restarts — use it whenever you discover a useful API pattern
-- Collections let you store structured data with full-text search — use them to save API patterns, scraped data, etc.`;
+## IMPORTANT: authenticated_fetch requires correct headers
+Websites use CSRF tokens and custom headers. You MUST inspect the real request via network_request_detail to see what headers are required. Just calling authenticated_fetch without the right headers will fail with 403/CSRF errors. The headers are in the captured request — copy them.
+
+## create_tool
+Creates a REAL MCP tool available immediately (no restart needed). The AI writes JavaScript that runs with:
+- params — tool input parameters
+- helpers.credentials(service) — stored auth tokens
+- helpers.browserFetch(url, opts) — request from browser context
+- helpers.store(service, key, val) — store a credential
+- helpers.query(collection, opts) / helpers.insert(collection, data) — SQLite collections
+- fetch — standard fetch for direct HTTP calls
+
+Always create_tool after you get a working authenticated_fetch pattern. This saves the user from waiting for rediscovery next time.`;
 
 const server = new McpServer(
     { name: "neo", version: "1.0.0" },
