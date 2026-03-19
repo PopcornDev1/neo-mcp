@@ -149,11 +149,12 @@ server.tool(
             return { content: [{ type: "text", text: "Capture stopped." }] };
         }
         // list
-        const requests = await browserCommand("network_list", { limit: 100 });
-        const lines = (requests || []).map((r: any) =>
+        const data = await browserCommand("network_list", { limit: 100 });
+        const entries = data?.requests || [];
+        const lines = entries.map((r: any) =>
             `${r.method} ${r.status || "?"} ${r.url?.slice(0, 120)}`
         );
-        return { content: [{ type: "text", text: lines.length > 0 ? lines.join("\n") : "No requests captured." }] };
+        return { content: [{ type: "text", text: lines.length > 0 ? `${data.total} requests captured:\n${lines.join("\n")}` : "No requests captured." }] };
     }
 );
 

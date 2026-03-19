@@ -121,9 +121,10 @@ server.tool("discover_api", `Discover API endpoints a website uses by capturing 
         return { content: [{ type: "text", text: "Capture stopped." }] };
     }
     // list
-    const requests = await browserCommand("network_list", { limit: 100 });
-    const lines = (requests || []).map((r) => `${r.method} ${r.status || "?"} ${r.url?.slice(0, 120)}`);
-    return { content: [{ type: "text", text: lines.length > 0 ? lines.join("\n") : "No requests captured." }] };
+    const data = await browserCommand("network_list", { limit: 100 });
+    const entries = data?.requests || [];
+    const lines = entries.map((r) => `${r.method} ${r.status || "?"} ${r.url?.slice(0, 120)}`);
+    return { content: [{ type: "text", text: lines.length > 0 ? `${data.total} requests captured:\n${lines.join("\n")}` : "No requests captured." }] };
 });
 // ── LinkedIn ─────────────────────────────────────────────────────────────────
 server.tool("linkedin_profile", "Get a LinkedIn user's profile. Pass the vanity name (URL slug, e.g. 'nirupambhowmick').", { vanity_name: z.string() }, async ({ vanity_name }) => {
