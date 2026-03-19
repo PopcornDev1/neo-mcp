@@ -684,7 +684,11 @@ server.tool(
 
 async function main() {
     // Start WebSocket server for browser extension
-    startBridge();
+    await startBridge();
+
+    // Wire browser command into integrations so they route through the extension
+    linkedin.setBrowserCommand(browserCommand);
+    twitter.setBrowserCommand(browserCommand);
 
     // Load and register all saved custom tools
     const customTools = db.getCustomTools();

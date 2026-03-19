@@ -1,8 +1,16 @@
 /**
  * LinkedIn integration via Voyager API.
  * Uses li_at cookie + JSESSIONID (csrf) extracted from browser.
+ *
+ * All requests go through the browser extension (browserFetch) because
+ * LinkedIn blocks direct Node.js fetch via TLS fingerprinting / Cloudflare.
  */
 const VOYAGER = "https://www.linkedin.com/voyager/api";
+// Set by the MCP server at init
+let _browserCommand = null;
+export function setBrowserCommand(fn) {
+    _browserCommand = fn;
+}
 async function linkedinApi(auth, path, options = {}) {
     const url = new URL(`${VOYAGER}${path}`);
     if (options.params) {
@@ -10,16 +18,34 @@ async function linkedinApi(auth, path, options = {}) {
             url.searchParams.set(k, v);
     }
     const headers = {
-        "Cookie": `li_at=${auth.li_at}; JSESSIONID="${auth.jsessionid}"`,
         "csrf-token": auth.jsessionid,
         "x-restli-protocol-version": "2.0.0",
         "x-li-lang": "en_US",
         "Accept": "application/vnd.linkedin.normalized+json+2.1",
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     };
     if (options.body) {
         headers["Content-Type"] = "application/json";
     }
+    // Route through browser extension — carries real browser TLS fingerprint
+    if (_browserCommand) {
+        const result = await _browserCommand("browser_fetch", {
+            url: url.toString(),
+            method: options.method || "GET",
+            headers,
+            body: options.body ? JSON.stringify(options.body) : undefined,
+            credentials: "include",
+        });
+        if (result.error)
+            throw new Error(result.error);
+        if (!result.ok) {
+            const text = typeof result.body === "string" ? result.body : JSON.stringify(result.body);
+            throw new Error(`LinkedIn API ${result.status}: ${text.slice(0, 200)}`);
+        }
+        return result.body;
+    }
+    // Fallback: direct fetch (may fail due to TLS fingerprinting)
+    headers["Cookie"] = `li_at=${auth.li_at}; JSESSIONID="${auth.jsessionid}"`;
+    headers["User-Agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
     const response = await fetch(url.toString(), {
         method: options.method || "GET",
         headers,

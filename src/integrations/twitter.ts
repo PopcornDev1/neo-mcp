@@ -13,6 +13,13 @@ export interface TwitterAuth {
     csrf_token: string;
 }
 
+// Set by the MCP server at init
+let _browserCommand: ((method: string, params: Record<string, any>) => Promise<any>) | null = null;
+
+export function setBrowserCommand(fn: (method: string, params: Record<string, any>) => Promise<any>) {
+    _browserCommand = fn;
+}
+
 // ── Runtime extraction cache ─────────────────────────────────────────────────
 
 interface TwitterConfig {
@@ -106,17 +113,44 @@ async function twitterApi<T = any>(
     }
 
     const headers: Record<string, string> = {
-        "Cookie": `auth_token=${auth.auth_token}; ct0=${auth.csrf_token}`,
         "x-csrf-token": auth.csrf_token,
         "authorization": `Bearer ${config.bearer}`,
         "x-twitter-active-user": "yes",
         "x-twitter-auth-type": "OAuth2Session",
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     };
 
     if (options.body) {
         headers["Content-Type"] = "application/json";
     }
+
+    // Route through browser extension if available
+    if (_browserCommand) {
+        const result = await _browserCommand("browser_fetch", {
+            url: url.toString(),
+            method: options.method || "GET",
+            headers,
+            body: options.body ? JSON.stringify(options.body) : undefined,
+            credentials: "include",
+        });
+
+        if (result.error) throw new Error(result.error);
+
+        if (result.status === 404) {
+            invalidateCache();
+            throw new Error("Twitter API 404 — query IDs may have rotated. Retry the call.");
+        }
+
+        if (!result.ok) {
+            const text = typeof result.body === "string" ? result.body : JSON.stringify(result.body);
+            throw new Error(`Twitter API ${result.status}: ${text.slice(0, 300)}`);
+        }
+
+        return result.body as T;
+    }
+
+    // Fallback: direct fetch
+    headers["Cookie"] = `auth_token=${auth.auth_token}; ct0=${auth.csrf_token}`;
+    headers["User-Agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
     const response = await fetch(url.toString(), {
         method: options.method || "GET",
@@ -124,7 +158,6 @@ async function twitterApi<T = any>(
         body: options.body ? JSON.stringify(options.body) : undefined,
     });
 
-    // If 404, query IDs may have rotated — invalidate and let next call re-extract
     if (response.status === 404) {
         invalidateCache();
         throw new Error("Twitter API 404 — query IDs may have rotated. Retry the call.");

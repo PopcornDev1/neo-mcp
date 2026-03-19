@@ -464,7 +464,10 @@ server.tool("delete_tool", "Delete a custom tool.", { name: z.string() }, async 
 // ── Start ────────────────────────────────────────────────────────────────────
 async function main() {
     // Start WebSocket server for browser extension
-    startBridge();
+    await startBridge();
+    // Wire browser command into integrations so they route through the extension
+    linkedin.setBrowserCommand(browserCommand);
+    twitter.setBrowserCommand(browserCommand);
     // Load and register all saved custom tools
     const customTools = db.getCustomTools();
     for (const tool of customTools) {

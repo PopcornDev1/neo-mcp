@@ -9,6 +9,7 @@ export interface TwitterAuth {
     auth_token: string;
     csrf_token: string;
 }
+export declare function setBrowserCommand(fn: (method: string, params: Record<string, any>) => Promise<any>): void;
 /** Get user profile by screen name */
 export declare function getProfile(auth: TwitterAuth, screenName: string): Promise<any>;
 /** Get a user's tweets */

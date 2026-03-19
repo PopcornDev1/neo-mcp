@@ -1,11 +1,15 @@
 /**
  * LinkedIn integration via Voyager API.
  * Uses li_at cookie + JSESSIONID (csrf) extracted from browser.
+ *
+ * All requests go through the browser extension (browserFetch) because
+ * LinkedIn blocks direct Node.js fetch via TLS fingerprinting / Cloudflare.
  */
 export interface LinkedInAuth {
     li_at: string;
     jsessionid: string;
 }
+export declare function setBrowserCommand(fn: (method: string, params: Record<string, any>) => Promise<any>): void;
 /** Get a user's profile by vanity name (the URL slug) */
 export declare function getProfile(auth: LinkedInAuth, vanityName: string): Promise<any>;
 /** Get the authenticated user's own posts with engagement metrics */
