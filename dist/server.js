@@ -123,7 +123,7 @@ server.tool("discover_api", `Discover API endpoints a website uses by capturing 
     // list
     const data = await browserCommand("network_list", { limit: 100 });
     const entries = data?.requests || [];
-    const lines = entries.map((r) => `${r.method} ${r.status || "?"} ${r.url?.slice(0, 120)}`);
+    const lines = entries.map((r) => `${r.method} ${r.status || "?"} ${r.url}`);
     return { content: [{ type: "text", text: lines.length > 0 ? `${data.total} requests captured:\n${lines.join("\n")}` : "No requests captured." }] };
 });
 // ── LinkedIn ─────────────────────────────────────────────────────────────────
@@ -374,7 +374,9 @@ Example — creating a Notion integration:
     db.saveCustomTool(name, description, params_schema, code, service);
     // Register on running server
     registerDynamicTool(name, description, params_schema, code);
-    return { content: [{ type: "text", text: `Tool "${name}" created and registered. It's now available as an MCP tool and will persist across restarts.` }] };
+    // Notify Claude Desktop that new tools are available
+    await server.server.sendToolListChanged();
+    return { content: [{ type: "text", text: `Tool "${name}" created and registered. Available immediately.` }] };
 });
 server.tool("list_custom_tools", "List all custom tools that have been created.", {}, async () => {
     const tools = db.getCustomTools();
@@ -391,7 +393,9 @@ server.tool("get_tool_code", "View the implementation code of a custom tool.", {
 });
 server.tool("delete_tool", "Delete a custom tool.", { name: z.string() }, async ({ name }) => {
     const deleted = db.deleteCustomTool(name);
-    return { content: [{ type: "text", text: deleted ? `Deleted "${name}". Restart MCP to fully unregister.` : `Tool "${name}" not found.` }] };
+    if (deleted)
+        await server.server.sendToolListChanged();
+    return { content: [{ type: "text", text: deleted ? `Deleted "${name}".` : `Tool "${name}" not found.` }] };
 });
 // ── Start ────────────────────────────────────────────────────────────────────
 async function main() {
