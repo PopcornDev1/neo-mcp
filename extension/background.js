@@ -998,6 +998,8 @@ async function browserFetch(params) {
 
     if (!tabId) throw new Error("Could not get a tab for " + targetDomain);
 
+    const mergedHeaders = { ...(params.headers || {}) };
+
     const results = await chrome.scripting.executeScript({
         target: { tabId },
         world: "MAIN",
@@ -1037,9 +1039,9 @@ async function browserFetch(params) {
         },
         args: [params.url, {
             method: params.method,
-            headers: params.headers,
+            headers: mergedHeaders,
             body: params.body,
-            credentials: params.credentials,
+            credentials: params.credentials || "include",
             mode: params.mode,
         }],
     });

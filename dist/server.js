@@ -303,8 +303,34 @@ server.tool("store_credential", "Manually store a credential for a service.", {
  *   - query(collection, opts): query a collection
  *   - insert(collection, data): insert into a collection
  */
-function registerDynamicTool(name, description, paramsSchema, code) {
-    // Build zod schema from simple type map
+// Track dynamic tool handles for update/remove
+const dynamicToolHandles = new Map();
+function buildToolCallback(code) {
+    return async (params) => {
+        try {
+            const helpers = {
+                credentials: (service) => db.getCredentials(service),
+                browserFetch: async (url, opts) => {
+                    if (!isBridgeConnected())
+                        throw new Error("Browser not connected");
+                    return browserCommand("browser_fetch", { url, ...opts, credentials: "include" });
+                },
+                store: (service, key, value) => db.storeCredential(service, key, value),
+                query: (collection, opts) => db.collectionQuery(collection, opts || {}),
+                insert: (collection, data) => db.collectionInsert(collection, data),
+            };
+            const AsyncFunction = Object.getPrototypeOf(async function () { }).constructor;
+            const fn = new AsyncFunction("params", "helpers", "fetch", code);
+            const result = await fn(params, helpers, globalThis.fetch);
+            const text = typeof result === "string" ? result : JSON.stringify(result, null, 2);
+            return { content: [{ type: "text", text }] };
+        }
+        catch (err) {
+            return { content: [{ type: "text", text: `Error: ${err.message}` }] };
+        }
+    };
+}
+function buildZodShape(paramsSchema) {
     const zodShape = {};
     for (const [param, type] of Object.entries(paramsSchema)) {
         const optional = type.endsWith("?");
@@ -329,31 +355,17 @@ function registerDynamicTool(name, description, paramsSchema, code) {
         }
         zodShape[param] = optional ? zType.optional() : zType;
     }
-    server.tool(name, description, zodShape, async (params) => {
-        try {
-            // Build the helper context the AI's code can use
-            const helpers = {
-                credentials: (service) => db.getCredentials(service),
-                browserFetch: async (url, opts) => {
-                    if (!isBridgeConnected())
-                        throw new Error("Browser not connected");
-                    return browserCommand("browser_fetch", { url, ...opts, credentials: "include" });
-                },
-                store: (service, key, value) => db.storeCredential(service, key, value),
-                query: (collection, opts) => db.collectionQuery(collection, opts || {}),
-                insert: (collection, data) => db.collectionInsert(collection, data),
-            };
-            // Execute the AI's code
-            const AsyncFunction = Object.getPrototypeOf(async function () { }).constructor;
-            const fn = new AsyncFunction("params", "helpers", "fetch", code);
-            const result = await fn(params, helpers, globalThis.fetch);
-            const text = typeof result === "string" ? result : JSON.stringify(result, null, 2);
-            return { content: [{ type: "text", text }] };
-        }
-        catch (err) {
-            return { content: [{ type: "text", text: `Error: ${err.message}` }] };
-        }
-    });
+    return zodShape;
+}
+function registerDynamicTool(name, description, paramsSchema, code) {
+    // Remove existing registration if updating
+    const existing = dynamicToolHandles.get(name);
+    if (existing) {
+        existing.remove();
+        dynamicToolHandles.delete(name);
+    }
+    const handle = server.tool(name, description, buildZodShape(paramsSchema), buildToolCallback(code));
+    dynamicToolHandles.set(name, handle);
 }
 server.tool("create_tool", `Create a new MCP tool that persists across restarts. You write the implementation as JavaScript.
 

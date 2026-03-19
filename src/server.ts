@@ -495,8 +495,36 @@ server.tool(
  *   - query(collection, opts): query a collection
  *   - insert(collection, data): insert into a collection
  */
-function registerDynamicTool(name: string, description: string, paramsSchema: Record<string, string>, code: string) {
-    // Build zod schema from simple type map
+// Track dynamic tool handles for update/remove
+const dynamicToolHandles = new Map<string, { remove: () => void; update: (u: any) => void }>();
+
+function buildToolCallback(code: string) {
+    return async (params: any) => {
+        try {
+            const helpers = {
+                credentials: (service: string) => db.getCredentials(service),
+                browserFetch: async (url: string, opts?: any) => {
+                    if (!isBridgeConnected()) throw new Error("Browser not connected");
+                    return browserCommand("browser_fetch", { url, ...opts, credentials: "include" });
+                },
+                store: (service: string, key: string, value: string) => db.storeCredential(service, key, value),
+                query: (collection: string, opts?: any) => db.collectionQuery(collection, opts || {}),
+                insert: (collection: string, data: any) => db.collectionInsert(collection, data),
+            };
+
+            const AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
+            const fn = new AsyncFunction("params", "helpers", "fetch", code);
+            const result = await fn(params, helpers, globalThis.fetch);
+
+            const text = typeof result === "string" ? result : JSON.stringify(result, null, 2);
+            return { content: [{ type: "text" as const, text }] };
+        } catch (err: any) {
+            return { content: [{ type: "text" as const, text: `Error: ${err.message}` }] };
+        }
+    };
+}
+
+function buildZodShape(paramsSchema: Record<string, string>) {
     const zodShape: Record<string, any> = {};
     for (const [param, type] of Object.entries(paramsSchema)) {
         const optional = type.endsWith("?");
@@ -511,32 +539,19 @@ function registerDynamicTool(name: string, description: string, paramsSchema: Re
         }
         zodShape[param] = optional ? zType.optional() : zType;
     }
+    return zodShape;
+}
 
-    server.tool(name, description, zodShape, async (params: any) => {
-        try {
-            // Build the helper context the AI's code can use
-            const helpers = {
-                credentials: (service: string) => db.getCredentials(service),
-                browserFetch: async (url: string, opts?: any) => {
-                    if (!isBridgeConnected()) throw new Error("Browser not connected");
-                    return browserCommand("browser_fetch", { url, ...opts, credentials: "include" });
-                },
-                store: (service: string, key: string, value: string) => db.storeCredential(service, key, value),
-                query: (collection: string, opts?: any) => db.collectionQuery(collection, opts || {}),
-                insert: (collection: string, data: any) => db.collectionInsert(collection, data),
-            };
+function registerDynamicTool(name: string, description: string, paramsSchema: Record<string, string>, code: string) {
+    // Remove existing registration if updating
+    const existing = dynamicToolHandles.get(name);
+    if (existing) {
+        existing.remove();
+        dynamicToolHandles.delete(name);
+    }
 
-            // Execute the AI's code
-            const AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
-            const fn = new AsyncFunction("params", "helpers", "fetch", code);
-            const result = await fn(params, helpers, globalThis.fetch);
-
-            const text = typeof result === "string" ? result : JSON.stringify(result, null, 2);
-            return { content: [{ type: "text" as const, text }] };
-        } catch (err: any) {
-            return { content: [{ type: "text" as const, text: `Error: ${err.message}` }] };
-        }
-    });
+    const handle = server.tool(name, description, buildZodShape(paramsSchema), buildToolCallback(code));
+    dynamicToolHandles.set(name, handle);
 }
 
 server.tool(
