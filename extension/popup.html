@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { width: 280px; font-family: system-ui, -apple-system, sans-serif; background: #0a0a0a; color: #e5e5e5; padding: 16px; }
+.header { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; }
+.header h1 { font-size: 16px; font-weight: 600; }
+.status { display: flex; align-items: center; gap: 6px; padding: 8px 12px; border-radius: 8px; margin-bottom: 12px; }
+.status.on { background: rgba(34,197,94,0.1); border: 1px solid rgba(34,197,94,0.3); }
+.status.off { background: rgba(239,68,68,0.1); border: 1px solid rgba(239,68,68,0.3); }
+.dot { width: 8px; height: 8px; border-radius: 50%; }
+.dot.on { background: #22c55e; }
+.dot.off { background: #ef4444; }
+.status-text { font-size: 12px; color: #999; }
+.actions { display: flex; flex-direction: column; gap: 8px; }
+button { background: #1a1a2e; border: 1px solid #333; color: #e5e5e5; padding: 8px 12px; border-radius: 6px; cursor: pointer; font-size: 12px; text-align: left; }
+button:hover { background: #252540; border-color: #555; }
+.service-list { margin-top: 12px; }
+.service-list h3 { font-size: 11px; text-transform: uppercase; color: #666; letter-spacing: 0.5px; margin-bottom: 6px; }
+.service { display: flex; justify-content: space-between; align-items: center; padding: 4px 0; font-size: 12px; }
+.service .name { color: #ccc; }
+.service .badge { font-size: 10px; padding: 1px 6px; border-radius: 4px; }
+.badge.yes { background: rgba(34,197,94,0.15); color: #22c55e; }
+.badge.no { color: #666; }
+.footer { margin-top: 16px; font-size: 10px; color: #444; text-align: center; }
+</style>
+</head>
+<body>
+<div class="header">
+    <h1>Neo Bridge</h1>
+</div>
+
+<div id="status" class="status off">
+    <div id="dot" class="dot off"></div>
+    <span id="status-text" class="status-text">Connecting...</span>
+</div>
+
+<div class="actions">
+    <button id="btn-reconnect">Reconnect to daemon</button>
+    <button id="btn-extract">Extract auth (current site)</button>
+</div>
+
+<div id="services" class="service-list"></div>
+
+<div class="footer">ws://127.0.0.1:7890</div>
+
+<script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,1271 @@
+/**
+ * Neo Bridge - Content Script
+ *
+ * Runs in every page. Full DOM control with:
+ * - Shadow DOM piercing (Google, Salesforce, Shopify, etc.)
+ * - Framework-aware interactions (React, Vue, Angular, Svelte, Lit)
+ * - Native event simulation (coordinates, bubbling, composed)
+ * - iframe traversal
+ * - Custom element / web component support
+ * - Contenteditable / WYSIWYG editors
+ * - File inputs, date pickers, sliders, color pickers
+ * - Drag and drop
+ */
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (!msg.action) return;
+    handleAction(msg.action, msg.params || {})
+        .then(sendResponse)
+        .catch((err) => sendResponse({ error: err.message || String(err) }));
+    return true;
+});
+
+async function handleAction(action, params) {
+    switch (action) {
+        case "click": return doClick(params.selector, params.text, params.ref);
+        case "type": return doType(params.selector || params.ref, params.text, params.clear, params.ref);
+        case "press_key": return doPressKey(params.key, params.selector || params.ref, params.modifiers);
+        case "clear": return doClear(params.selector || params.ref);
+        case "select": return doSelect(params.selector || params.ref, params.value, params.text);
+        case "check": return doCheck(params.selector || params.ref, params.checked);
+        case "scroll": return doScroll(params.direction, params.amount, params.selector);
+        case "focus": return doFocus(params.selector || params.ref);
+        case "hover": return doHover(params.selector, params.text, params.ref);
+        case "drag_drop": return doDragDrop(params.source, params.target);
+        case "upload_file": return { error: "File upload requires a file path - use browser_execute_js with a DataTransfer approach" };
+
+        case "read_text": return readText(params.selector);
+        case "read_html": return readHtml(params.selector);
+        case "read_page": return readPage(params);
+        case "read_attribute": return readAttribute(params.selector, params.attribute);
+        case "read_value": return readValue(params.selector);
+        case "query_selector": return querySelector(params.selector);
+        case "query_selector_all": return querySelectorAll(params.selector, params.max);
+        case "wait_for": return waitFor(params.selector, params.timeout, params.text);
+        case "wait_for_navigation": return waitForNavigation(params.timeout);
+        case "get_page_info": return getPageInfo();
+
+        case "extract_local_storage": return extractLocalStorage(params.keys);
+        case "extract_session_storage": return extractSessionStorage(params.keys);
+        case "scroll_collect": return scrollAndCollect(params);
+        case "execute_js": return executeJs(params.code);
+        case "screenshot_full": return screenshotFull();
+
+        default: throw new Error(`Unknown action: ${action}`);
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// DEEP DOM TRAVERSAL - Pierces shadow DOM, iframes, slots
+// ══════════════════════════════════════════════════════════════════════════════
+
+function deepQuerySelector(root, selector) {
+    try {
+        const light = root.querySelector(selector);
+        if (light) return light;
+    } catch {}
+
+    const queue = [root];
+    while (queue.length > 0) {
+        const node = queue.shift();
+        const children = node.querySelectorAll ? node.querySelectorAll("*") : [];
+        for (const el of children) {
+            if (el.shadowRoot) {
+                try {
+                    const found = el.shadowRoot.querySelector(selector);
+                    if (found) return found;
+                } catch {}
+                queue.push(el.shadowRoot);
+            }
+        }
+    }
+    return null;
+}
+
+function deepQuerySelectorAll(root, selector) {
+    const results = [];
+    try { results.push(...root.querySelectorAll(selector)); } catch {}
+
+    const queue = [root];
+    while (queue.length > 0) {
+        const node = queue.shift();
+        const children = node.querySelectorAll ? node.querySelectorAll("*") : [];
+        for (const el of children) {
+            if (el.shadowRoot) {
+                try { results.push(...el.shadowRoot.querySelectorAll(selector)); } catch {}
+                queue.push(el.shadowRoot);
+            }
+        }
+    }
+    return results;
+}
+
+/**
+ * Walk every element in the DOM tree including shadow roots.
+ * Uses BFS to avoid stack overflow on deep DOMs.
+ */
+function collectAllElements(root) {
+    const elements = [];
+    const queue = [root];
+    while (queue.length > 0) {
+        const node = queue.shift();
+        const children = node.children || [];
+        for (let i = 0; i < children.length; i++) {
+            const child = children[i];
+            if (child.nodeType !== 1) continue;
+            elements.push(child);
+            if (child.shadowRoot) queue.push(child.shadowRoot);
+            queue.push(child);
+        }
+    }
+    return elements;
+}
+
+/**
+ * Collect interactive elements, viewport-first.
+ * Elements in the visible viewport come first, off-screen elements after.
+ * This ensures the agent always sees what's on screen before hitting the cap.
+ */
+function collectInteractiveElements(root) {
+    const all = collectAllElements(root);
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const inViewport = [];
+    const offScreen = [];
+
+    for (const el of all) {
+        if (!isRelevantElement(el)) continue;
+
+        let rect;
+        try { rect = el.getBoundingClientRect(); } catch { continue; }
+        if (rect.width === 0 && rect.height === 0) continue;
+
+        // Check if any part of the element is in the viewport
+        if (rect.bottom > 0 && rect.top < vh && rect.right > 0 && rect.left < vw) {
+            inViewport.push(el);
+        } else {
+            offScreen.push(el);
+        }
+    }
+
+    // Viewport elements first, then off-screen
+    return [...inViewport, ...offScreen];
+}
+
+function isRelevantElement(el) {
+    const tag = el.tagName?.toLowerCase();
+    const role = el.getAttribute?.("role");
+    return /^h[1-6]$/.test(tag) ||
+        (tag === "a" && el.href) ||
+        tag === "button" || tag === "input" || tag === "textarea" || tag === "select" ||
+        (el.isContentEditable && el.getAttribute?.("contenteditable") === "true") ||
+        role === "button" || role === "link" || role === "tab" || role === "menuitem" ||
+        role === "option" || role === "switch" || role === "checkbox" || role === "radio" ||
+        role === "listitem" ||
+        el.hasAttribute?.("onclick") || el.hasAttribute?.("tabindex");
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ELEMENT REF MAP - Survives SPA re-renders
+//
+// readPage stores direct JS references in this Map.
+// Click-by-ref looks up the Map first (instant, guaranteed).
+// Falls back to data-neo-ref attribute, then text/selector search.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ref number -> { element, tag, text, selector }
+// Stores both the DOM reference AND metadata to re-find if element goes stale
+const refMap = new Map();
+
+function findElement(selector, text, ref) {
+    if (ref !== undefined && ref !== null) {
+        const entry = refMap.get(Number(ref));
+        if (entry) {
+            // Try 1: direct DOM reference (fastest, works if element wasn't re-rendered)
+            if (entry.element && entry.element.isConnected) return entry.element;
+
+            // Try 2: data attribute (works if re-render preserved attributes)
+            const byAttr = deepQuerySelector(document, `[data-neo-ref="${ref}"]`);
+            if (byAttr) return byAttr;
+
+            // Try 3: re-find by stored metadata (works after SPA re-renders)
+            if (entry.text) {
+                const candidates = findAllCandidates(null, entry.text);
+                if (candidates.length > 0) return candidates[0];
+            }
+
+            // Try 4: unique selector generated at tag time
+            if (entry.selector) {
+                const bySelector = deepQuerySelector(document, entry.selector);
+                if (bySelector) return bySelector;
+            }
+        }
+    }
+
+    // Standard lookup by selector or text
+    const candidates = findAllCandidates(selector, text);
+    if (candidates.length === 0) {
+        if (ref !== undefined && ref !== null) {
+            throw new Error(`Ref ${ref} is stale (page changed). Call browser_read_page to get fresh refs.`);
+        }
+        throw new Error(`Element not found: ${selector || text}`);
+    }
+    return candidates[0];
+}
+
+function findAllCandidates(selector, text) {
+    const found = [];
+
+    // Strategy 1: CSS selector (deep)
+    if (selector) {
+        const el = deepQuerySelector(document, selector);
+        if (el) found.push(el);
+
+        // Also try without deep (some selectors work better in light DOM)
+        if (!el) {
+            try {
+                const light = document.querySelector(selector);
+                if (light) found.push(light);
+            } catch {}
+        }
+    }
+
+    // Strategy 2: XPath
+    if (selector && selector.startsWith("/")) {
+        try {
+            const result = document.evaluate(selector, document, null, XPathResult.ORDERED_NODE_ITERATOR_TYPE, null);
+            let node;
+            while ((node = result.iterateNext())) {
+                if (node.nodeType === 1) found.push(node);
+            }
+        } catch {}
+    }
+
+    // Strategy 3: Text matching (deep, multi-pass)
+    if (text) {
+        const allElements = collectAllElements(document.body);
+        const textLower = text.toLowerCase().trim();
+
+        // Pass 1: Exact innerText match on interactive elements (buttons, links, inputs)
+        for (const el of allElements) {
+            if (!isInteractive(el)) continue;
+            const elText = getVisibleText(el);
+            if (elText === text || elText === textLower) found.push(el);
+        }
+
+        // Pass 2: Exact match on any element
+        if (found.length === 0) {
+            for (const el of allElements) {
+                const elText = getVisibleText(el);
+                if (elText === text) found.push(el);
+            }
+        }
+
+        // Pass 3: Case-insensitive match
+        if (found.length === 0) {
+            for (const el of allElements) {
+                const elText = getVisibleText(el).toLowerCase();
+                if (elText === textLower) found.push(el);
+            }
+        }
+
+        // Pass 4: Attribute match (aria-label, placeholder, title, alt, data-*)
+        if (found.length === 0) {
+            const attrs = ["aria-label", "placeholder", "title", "alt", "data-text", "data-tooltip",
+                           "data-testid", "data-name", "value", "name"];
+            for (const el of allElements) {
+                for (const attr of attrs) {
+                    const val = el.getAttribute?.(attr);
+                    if (val && val.trim().toLowerCase() === textLower) {
+                        found.push(el);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Pass 5: Contains match on leaf-ish interactive elements
+        if (found.length === 0) {
+            for (const el of allElements) {
+                const elText = getVisibleText(el).toLowerCase();
+                if (elText.length > 0 && elText.length < 150 && elText.includes(textLower)) {
+                    if (isInteractive(el) || isLeafElement(el)) found.push(el);
+                }
+            }
+        }
+
+        // Pass 6: Partial attribute match
+        if (found.length === 0) {
+            for (const el of allElements) {
+                const label = el.getAttribute?.("aria-label") || el.getAttribute?.("title") || "";
+                if (label.toLowerCase().includes(textLower)) found.push(el);
+            }
+        }
+    }
+
+    // Deduplicate
+    return [...new Set(found)];
+}
+
+function getVisibleText(el) {
+    return (el.innerText || el.textContent || "").trim();
+}
+
+function isInteractive(el) {
+    const tag = el.tagName?.toLowerCase();
+    const role = el.getAttribute?.("role");
+    return tag === "button" || tag === "a" || tag === "input" || tag === "select" ||
+           tag === "textarea" || tag === "summary" || tag === "label" ||
+           role === "button" || role === "link" || role === "tab" || role === "menuitem" ||
+           role === "option" || role === "switch" || role === "checkbox" || role === "radio" ||
+           el.hasAttribute?.("onclick") || el.hasAttribute?.("tabindex") ||
+           el.style?.cursor === "pointer";
+}
+
+function isLeafElement(el) {
+    const children = el.children;
+    if (!children || children.length === 0) return true;
+    // Only has inline children (span, strong, em, etc.)
+    for (const child of children) {
+        const tag = child.tagName?.toLowerCase();
+        if (!["span", "strong", "em", "b", "i", "u", "small", "sub", "sup",
+               "img", "svg", "icon", "mat-icon"].includes(tag)) return false;
+    }
+    return true;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ACTIONS - Framework-aware, bulletproof event dispatch
+// ══════════════════════════════════════════════════════════════════════════════
+
+function doClick(selector, text, ref) {
+    const el = findElement(typeof ref === "number" ? null : selector, text, ref);
+
+    // Pre-click validation
+    const warnings = [];
+    if (el.disabled) warnings.push("element is disabled");
+    if (el.getAttribute("aria-disabled") === "true") warnings.push("element is aria-disabled");
+
+    // Check if something is blocking the click target (overlay/modal)
+    el.scrollIntoView({ behavior: "instant", block: "center", inline: "center" });
+
+    const rect = el.getBoundingClientRect();
+    const x = rect.left + rect.width / 2;
+    const y = rect.top + rect.height / 2;
+
+    const topEl = document.elementFromPoint(x, y);
+    if (topEl && topEl !== el && !el.contains(topEl) && !topEl.contains(el)) {
+        // Something is on top of our target
+        const blockerTag = topEl.tagName?.toLowerCase();
+        const blockerClass = topEl.className?.toString?.() || "";
+        if (/overlay|modal|banner|popup|dialog|backdrop/i.test(blockerClass) ||
+            topEl.getAttribute("role") === "dialog") {
+            warnings.push(`blocked by ${blockerTag}.${blockerClass.split(" ")[0]} — dismiss overlay first`);
+        }
+    }
+
+    const eventOpts = {
+        bubbles: true, cancelable: true, composed: true,
+        clientX: x, clientY: y, screenX: x, screenY: y,
+        button: 0, buttons: 1,
+        view: window,
+    };
+
+    // Single clean click sequence. NO el.click() after — that causes double-click
+    // which toggles dropdowns/menus open then immediately shut.
+    el.dispatchEvent(new PointerEvent("pointerover", { ...eventOpts, pointerType: "mouse" }));
+    el.dispatchEvent(new MouseEvent("mouseover", eventOpts));
+    el.dispatchEvent(new PointerEvent("pointerenter", { ...eventOpts, pointerType: "mouse" }));
+    el.dispatchEvent(new MouseEvent("mouseenter", eventOpts));
+    el.dispatchEvent(new PointerEvent("pointerdown", { ...eventOpts, pointerType: "mouse" }));
+    el.dispatchEvent(new MouseEvent("mousedown", eventOpts));
+    el.focus({ preventScroll: true });
+    el.dispatchEvent(new PointerEvent("pointerup", { ...eventOpts, pointerType: "mouse" }));
+    el.dispatchEvent(new MouseEvent("mouseup", eventOpts));
+    el.dispatchEvent(new MouseEvent("click", eventOpts));
+
+    const result = { clicked: true, tag: el.tagName, text: getVisibleText(el).slice(0, 80) };
+    if (warnings.length > 0) result.warnings = warnings;
+    return result;
+}
+
+function doHover(selector, text, ref) {
+    const el = findElement(typeof ref === "number" ? null : selector, text, ref);
+    el.scrollIntoView({ behavior: "instant", block: "center" });
+    const rect = el.getBoundingClientRect();
+    const x = rect.left + rect.width / 2;
+    const y = rect.top + rect.height / 2;
+    const opts = { bubbles: true, composed: true, clientX: x, clientY: y, view: window };
+    el.dispatchEvent(new PointerEvent("pointerover", { ...opts, pointerType: "mouse" }));
+    el.dispatchEvent(new MouseEvent("mouseover", opts));
+    el.dispatchEvent(new PointerEvent("pointerenter", { ...opts, pointerType: "mouse" }));
+    el.dispatchEvent(new MouseEvent("mouseenter", opts));
+    el.dispatchEvent(new MouseEvent("mousemove", opts));
+    return { hovered: true, tag: el.tagName };
+}
+
+function doType(selectorOrRef, text, clear, ref) {
+    const el = findElement(typeof ref === "number" ? null : selectorOrRef, null, typeof selectorOrRef === "number" ? selectorOrRef : ref);
+    el.scrollIntoView({ behavior: "instant", block: "center" });
+    el.focus({ preventScroll: true });
+
+    // Handle contenteditable (WYSIWYG editors, Notion, Google Docs, Slack)
+    if (el.isContentEditable || el.getAttribute("contenteditable") === "true") {
+        if (clear) {
+            el.innerHTML = "";
+            el.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+        }
+        // Use execCommand for contenteditable (works with undo stack)
+        document.execCommand("insertText", false, text);
+        el.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+        return { typed: true, length: text.length, contenteditable: true };
+    }
+
+    // Standard inputs
+    if (clear) {
+        setNativeValue(el, "");
+        el.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+    }
+
+    const newValue = (clear ? "" : el.value || "") + text;
+    setNativeValue(el, newValue);
+
+    // Dispatch events that frameworks listen to
+    el.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+
+    // Key events for frameworks that use keydown/keyup (React, Angular)
+    for (const char of text) {
+        const keyOpts = { key: char, code: `Key${char.toUpperCase()}`, bubbles: true, composed: true };
+        el.dispatchEvent(new KeyboardEvent("keydown", keyOpts));
+        el.dispatchEvent(new KeyboardEvent("keypress", keyOpts));
+        el.dispatchEvent(new InputEvent("input", {
+            bubbles: true, composed: true, data: char, inputType: "insertText",
+        }));
+        el.dispatchEvent(new KeyboardEvent("keyup", keyOpts));
+    }
+
+    return { typed: true, length: text.length };
+}
+
+/**
+ * Set input value bypassing React/Angular/Vue controlled component protections.
+ */
+function setNativeValue(el, value) {
+    // Get the native setter from the prototype chain
+    const proto = Object.getPrototypeOf(el);
+    const descriptor =
+        Object.getOwnPropertyDescriptor(proto, "value") ||
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value") ||
+        Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value") ||
+        Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value");
+
+    if (descriptor && descriptor.set) {
+        descriptor.set.call(el, value);
+    } else {
+        el.value = value;
+    }
+
+    // React 16+ uses a synthetic event system with _valueTracker
+    const tracker = el._valueTracker;
+    if (tracker) tracker.setValue(value === "" ? " " : ""); // force React to see the change
+}
+
+function doPressKey(key, selector, modifiers) {
+    const el = selector ? findElement(selector) : document.activeElement || document.body;
+    const mods = modifiers || {};
+    const opts = {
+        key, code: key.length === 1 ? `Key${key.toUpperCase()}` : key,
+        bubbles: true, composed: true,
+        ctrlKey: !!mods.ctrl, shiftKey: !!mods.shift,
+        altKey: !!mods.alt, metaKey: !!mods.meta,
+        view: window,
+    };
+
+    el.dispatchEvent(new KeyboardEvent("keydown", opts));
+    el.dispatchEvent(new KeyboardEvent("keypress", opts));
+
+    // Handle Enter on forms
+    if (key === "Enter") {
+        const form = el.closest?.("form");
+        if (form) {
+            const submitBtn = form.querySelector("[type='submit'], button:not([type='button'])");
+            if (submitBtn) submitBtn.click();
+            else form.requestSubmit ? form.requestSubmit() : form.submit();
+        }
+    }
+
+    // Handle Tab
+    if (key === "Tab") {
+        const focusable = deepQuerySelectorAll(document, "input, textarea, select, button, a[href], [tabindex]")
+            .filter((e) => !e.disabled && e.tabIndex >= 0);
+        const idx = focusable.indexOf(el);
+        if (idx >= 0 && idx < focusable.length - 1) focusable[idx + 1].focus();
+    }
+
+    el.dispatchEvent(new KeyboardEvent("keyup", opts));
+    return { pressed: key };
+}
+
+function doClear(selector) {
+    const el = findElement(selector);
+    if (el.isContentEditable) {
+        el.innerHTML = "";
+    } else {
+        setNativeValue(el, "");
+    }
+    el.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+    return { cleared: true };
+}
+
+function doSelect(selector, value, text) {
+    const el = findElement(selector);
+
+    if (el.tagName === "SELECT") {
+        // Native select: find option by value or text
+        const options = Array.from(el.options);
+        const option = options.find((o) => o.value === value || o.text === (text || value));
+        if (option) {
+            el.value = option.value;
+            option.selected = true;
+        } else {
+            el.value = value;
+        }
+        el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+        el.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+        return { selected: el.value };
+    }
+
+    // Custom dropdown: click to open, then click option
+    el.click();
+    return { selected: value, note: "Clicked element. For custom dropdowns, follow up with a click on the option." };
+}
+
+function doCheck(selector, checked) {
+    const el = findElement(selector);
+    const shouldBeChecked = checked !== undefined ? checked : !el.checked;
+
+    if (el.checked !== shouldBeChecked) {
+        el.click();
+    }
+
+    // Force the state if click didn't work
+    if (el.checked !== shouldBeChecked) {
+        el.checked = shouldBeChecked;
+        el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+        el.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+    }
+
+    return { checked: el.checked };
+}
+
+function doScroll(direction, amount, selector) {
+    const target = selector ? findElement(selector) : null;
+    const pixels = amount || 500;
+    const opts = { behavior: "instant" };
+
+    const scrollTarget = target || window;
+    const map = {
+        up: [0, -pixels], down: [0, pixels],
+        left: [-pixels, 0], right: [pixels, 0],
+    };
+
+    if (direction === "top") {
+        (target || document.documentElement).scrollTop = 0;
+    } else if (direction === "bottom") {
+        const s = target || document.documentElement;
+        s.scrollTop = s.scrollHeight;
+    } else if (map[direction]) {
+        scrollTarget.scrollBy?.({ left: map[direction][0], top: map[direction][1], ...opts }) ||
+            scrollTarget.scrollBy?.(map[direction][0], map[direction][1]);
+    }
+
+    return { scrolled: direction, amount: pixels };
+}
+
+function doFocus(selector) {
+    const el = findElement(selector);
+    el.focus({ preventScroll: false });
+    return { focused: true, tag: el.tagName };
+}
+
+function doDragDrop(sourceSelector, targetSelector) {
+    const source = findElement(sourceSelector);
+    const target = findElement(targetSelector);
+    const srcRect = source.getBoundingClientRect();
+    const tgtRect = target.getBoundingClientRect();
+    const dataTransfer = new DataTransfer();
+
+    source.dispatchEvent(new DragEvent("dragstart", {
+        bubbles: true, composed: true, dataTransfer,
+        clientX: srcRect.left + srcRect.width / 2, clientY: srcRect.top + srcRect.height / 2,
+    }));
+    target.dispatchEvent(new DragEvent("dragover", {
+        bubbles: true, composed: true, dataTransfer,
+        clientX: tgtRect.left + tgtRect.width / 2, clientY: tgtRect.top + tgtRect.height / 2,
+    }));
+    target.dispatchEvent(new DragEvent("drop", {
+        bubbles: true, composed: true, dataTransfer,
+        clientX: tgtRect.left + tgtRect.width / 2, clientY: tgtRect.top + tgtRect.height / 2,
+    }));
+    source.dispatchEvent(new DragEvent("dragend", { bubbles: true, composed: true, dataTransfer }));
+
+    return { dragged: true };
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// READING
+// ══════════════════════════════════════════════════════════════════════════════
+
+function readText(selector) {
+    if (!selector) return { text: document.body.innerText.slice(0, 50000) };
+    const el = deepQuerySelector(document, selector) || findElement(selector);
+    return { text: (el.innerText || el.textContent || "").slice(0, 50000) };
+}
+
+function readHtml(selector) {
+    if (!selector) return { html: document.body.innerHTML.slice(0, 50000) };
+    const el = deepQuerySelector(document, selector) || findElement(selector);
+    return { html: el.innerHTML.slice(0, 50000) };
+}
+
+function readAttribute(selector, attribute) {
+    const el = findElement(selector);
+    return { value: el.getAttribute(attribute) };
+}
+
+function readValue(selector) {
+    const el = findElement(selector);
+    if (el.isContentEditable) return { value: el.innerText };
+    return { value: el.value };
+}
+
+function querySelector(selector) {
+    const el = deepQuerySelector(document, selector);
+    if (!el) return { found: false };
+    return { found: true, tag: el.tagName, text: getVisibleText(el).slice(0, 200), id: el.id };
+}
+
+function querySelectorAll(selector, max) {
+    const elements = deepQuerySelectorAll(document, selector).slice(0, max || 50);
+    return {
+        count: elements.length,
+        elements: elements.map((el, i) => ({
+            index: i, tag: el.tagName, text: getVisibleText(el).slice(0, 100), id: el.id,
+        })),
+    };
+}
+
+async function waitFor(selector, timeout, text) {
+    const deadline = Date.now() + (timeout || 10000);
+    while (Date.now() < deadline) {
+        try {
+            const el = text ? findElement(null, text) : (deepQuerySelector(document, selector) || findElement(selector));
+            if (el) {
+                const vis = el.getBoundingClientRect();
+                if (vis.width > 0 && vis.height > 0) return { found: true, tag: el.tagName, text: getVisibleText(el).slice(0, 80) };
+            }
+        } catch {}
+        await new Promise((r) => setTimeout(r, 250));
+    }
+    return { found: false, timeout: true };
+}
+
+async function waitForNavigation(timeout) {
+    const startUrl = window.location.href;
+    const deadline = Date.now() + (timeout || 15000);
+    while (Date.now() < deadline) {
+        if (window.location.href !== startUrl) {
+            return { navigated: true, from: startUrl, to: window.location.href };
+        }
+        await new Promise((r) => setTimeout(r, 200));
+    }
+    return { navigated: false, timeout: true };
+}
+
+function getPageInfo() {
+    return {
+        title: document.title, url: window.location.href,
+        domain: window.location.hostname, readyState: document.readyState,
+        scrollY: window.scrollY, scrollHeight: document.body.scrollHeight,
+        viewportHeight: window.innerHeight, viewportWidth: window.innerWidth,
+        hasShadowRoots: !!document.querySelector("*")?.shadowRoot || document.querySelectorAll("*").length > 0,
+    };
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PAGE READING - Compact accessibility tree
+//
+// Viewport-first: elements visible on screen come first, always included.
+// Every element gets a ref stored in both a JS Map and data attribute.
+// The agent clicks by ref — direct, guaranteed, no text matching.
+// ══════════════════════════════════════════════════════════════════════════════
+
+function dismissOverlays() {
+    // Cookie consent banners
+    const cookieSelectors = [
+        '[class*="cookie"] button[class*="accept"]',
+        '[class*="cookie"] button[class*="agree"]',
+        '[class*="consent"] button[class*="accept"]',
+        '[class*="consent"] button[class*="agree"]',
+        '[id*="cookie"] button',
+        '[id*="consent"] button',
+        'button[id*="accept-cookie"]',
+        '[class*="cookie-banner"] button:first-of-type',
+        '[data-testid*="cookie"] button',
+        '#onetrust-accept-btn-handler',
+        '.cc-accept', '.cc-dismiss',
+    ];
+    for (const sel of cookieSelectors) {
+        try {
+            const btn = document.querySelector(sel);
+            if (btn && btn.offsetWidth > 0) { btn.click(); return true; }
+        } catch {}
+    }
+
+    // Generic dismiss: modals/overlays with close buttons
+    const overlaySelectors = [
+        '[role="dialog"] button[aria-label*="close" i]',
+        '[role="dialog"] button[aria-label*="dismiss" i]',
+        '[class*="modal"] button[class*="close"]',
+        '[class*="overlay"] button[class*="close"]',
+        '[class*="popup"] button[class*="close"]',
+        '[class*="banner"] button[aria-label*="close" i]',
+        '[class*="notification"] button[class*="close"]',
+    ];
+    for (const sel of overlaySelectors) {
+        try {
+            const btn = document.querySelector(sel);
+            if (btn && btn.offsetWidth > 0) {
+                // Only dismiss if it's blocking: covers >50% of viewport
+                const overlay = btn.closest('[role="dialog"], [class*="modal"], [class*="overlay"], [class*="popup"]');
+                if (overlay) {
+                    const rect = overlay.getBoundingClientRect();
+                    if (rect.width > window.innerWidth * 0.4 || rect.height > window.innerHeight * 0.4) {
+                        btn.click();
+                        return true;
+                    }
+                }
+            }
+        } catch {}
+    }
+    return false;
+}
+
+function readPage(params) {
+    params = params || {};
+
+    // Auto-dismiss overlays before reading (cookie banners, modals, etc.)
+    try { dismissOverlays(); } catch {}
+
+    const title = document.title;
+    const url = window.location.href;
+
+    // Legacy mode support for backward compat
+    if (params.mode === "text") return { title, url, text: document.body.innerText.slice(0, params.max_length || 8000) };
+    if (params.mode === "full") return readPageFull(params.max_length);
+
+    // Default: if no field flags specified, return elements
+    const hasField = params.elements || params.text || params.links || params.headings || params.inputs || params.forms || params.tree;
+    if (!hasField && !params.mode) params.elements = true;
+
+    const MAX_ELEMENTS = params.max_elements || 200;
+    const result = { title, url };
+
+    // Determine scope root
+    let scopeRoot = document.body;
+    if (params.selector) {
+        const scoped = deepQuerySelector(document, params.selector);
+        if (scoped) scopeRoot = scoped;
+    } else if (params.within !== undefined && params.within !== null) {
+        const entry = refMap.get(Number(params.within));
+        if (entry && entry.element && entry.element.isConnected) {
+            scopeRoot = entry.element;
+        }
+    }
+
+    // Build text filter function from query/regex
+    let textFilter = null;
+    if (params.query) {
+        const q = params.query.toLowerCase();
+        textFilter = (text) => text.toLowerCase().includes(q);
+    } else if (params.regex) {
+        try {
+            const re = new RegExp(params.regex, "i");
+            textFilter = (text) => re.test(text);
+        } catch {}
+    }
+
+    // ── Elements (interactive elements with refs) ──
+    if (params.elements) {
+        // Auto-reads (_autoRead) don't clear refs — they preserve refs from
+        // explicit reads so the model can keep clicking old refs.
+        // Explicit reads reset everything for a clean slate.
+        if (!params._autoRead) {
+            refMap.clear();
+            try { deepQuerySelectorAll(document, "[data-neo-ref]").forEach((el) => el.removeAttribute("data-neo-ref")); } catch {}
+        }
+
+        const maxEl = typeof params.elements === "number" ? Math.min(params.elements, MAX_ELEMENTS) : MAX_ELEMENTS;
+        const elements = collectInteractiveElements(scopeRoot);
+        const nodes = [];
+        // Continue ref numbering from where we left off for auto-reads
+        let idx = params._autoRead ? refMap.size : 0;
+
+        for (const el of elements) {
+            if (nodes.length >= maxEl) break;
+            // Skip elements that already have a ref (auto-read dedup)
+            if (params._autoRead && el.hasAttribute("data-neo-ref")) {
+                const existingRef = Number(el.getAttribute("data-neo-ref"));
+                const entry = refMap.get(existingRef);
+                if (entry && entry.element === el) {
+                    const node = describeElement(el);
+                    if (!node) continue;
+                    if (textFilter && !textFilter(node.text || node.label || "")) continue;
+                    node.ref = existingRef;
+                    nodes.push(node);
+                    continue;
+                }
+            }
+            const node = describeElement(el);
+            if (!node) continue;
+            if (textFilter && !textFilter(node.text || node.label || "")) continue;
+            tagElementToRef(el, node, idx);
+            idx++;
+            nodes.push(node);
+        }
+
+        result.elements = nodes;
+        result.elementCount = nodes.length;
+        result.totalOnPage = elements.length;
+    }
+
+    // ── Text (visible page text) ──
+    if (params.text) {
+        let text = (scopeRoot.innerText || "").trim();
+        if (textFilter) {
+            // Filter to only paragraphs/lines matching
+            const lines = text.split("\n");
+            text = lines.filter((line) => line.trim() && textFilter(line)).join("\n");
+        }
+        const maxLen = params.max_length || 8000;
+        result.text = text.slice(0, maxLen);
+    }
+
+    // ── Links ──
+    if (params.links) {
+        let linkEls = Array.from(scopeRoot.querySelectorAll("a[href]"));
+        if (textFilter) linkEls = linkEls.filter((a) => textFilter(getVisibleText(a) + " " + a.href));
+        result.links = linkEls.slice(0, MAX_ELEMENTS).map((a) => ({
+            text: getVisibleText(a).slice(0, 60),
+            href: a.href,
+        })).filter((l) => l.text && l.href?.startsWith("http"));
+    }
+
+    // ── Headings (h1-h6 structure) ──
+    if (params.headings) {
+        const headingEls = scopeRoot.querySelectorAll("h1, h2, h3, h4, h5, h6");
+        const headings = [];
+        for (const el of headingEls) {
+            const text = getVisibleText(el).slice(0, 120);
+            if (!text) continue;
+            if (textFilter && !textFilter(text)) continue;
+            headings.push({ level: el.tagName.toLowerCase(), text });
+        }
+        result.headings = headings;
+    }
+
+    // ── Inputs (form fields only) ──
+    if (params.inputs) {
+        const inputEls = deepQuerySelectorAll(scopeRoot, "input:not([type=hidden]), textarea, select");
+        result.inputs = inputEls.slice(0, MAX_ELEMENTS).map((el) => ({
+            tag: el.tagName.toLowerCase(),
+            type: el.type || undefined,
+            name: el.name || undefined,
+            id: el.id || undefined,
+            placeholder: el.placeholder || undefined,
+            value: el.value?.slice(0, 60) || undefined,
+            label: elementLabel(el),
+        }));
+    }
+
+    // ── Forms (grouped by form element) ──
+    if (params.forms) {
+        const formEls = scopeRoot.querySelectorAll("form");
+        const forms = [];
+        for (const form of formEls) {
+            const fields = [];
+            const children = form.querySelectorAll("input:not([type=hidden]), textarea, select, button, [role=button]");
+            for (const el of children) {
+                const tag = el.tagName.toLowerCase();
+                if (tag === "button" || el.getAttribute("role") === "button" || (tag === "input" && el.type === "submit")) {
+                    fields.push({ tag: "button", text: elementLabel(el) });
+                } else {
+                    fields.push({
+                        tag: tag === "select" ? "select" : "input",
+                        type: el.type || undefined,
+                        name: el.name || undefined,
+                        placeholder: el.placeholder || undefined,
+                        label: elementLabel(el),
+                    });
+                }
+            }
+            forms.push({
+                id: form.id || undefined,
+                action: form.action || undefined,
+                fields,
+            });
+        }
+        result.forms = forms;
+    }
+
+    // ── Tree (DOM structure) ──
+    if (params.tree) {
+        const maxDepth = params.depth || 3;
+        result.tree = buildDomTree(scopeRoot, 0, maxDepth, textFilter);
+    }
+
+    return result;
+}
+
+// ── Helpers for readPage ──
+
+function elementLabel(el) {
+    const ariaLabel = el.getAttribute?.("aria-label");
+    if (ariaLabel) return ariaLabel.trim().slice(0, 80);
+    const title = el.getAttribute?.("title");
+    if (title) return title.trim().slice(0, 80);
+    const placeholder = el.getAttribute?.("placeholder");
+    if (placeholder) return placeholder.trim().slice(0, 80);
+    let text = getVisibleText(el);
+    text = text.split("\n")
+        .filter((line) => {
+            const t = line.trim();
+            return t.length > 0 && !(t.length < 20 && /^[a-z_]+$/.test(t));
+        })
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim();
+    return text.slice(0, 80) || el.getAttribute?.("alt") || "";
+}
+
+function describeElement(el) {
+    const tag = el.tagName?.toLowerCase();
+    const role = el.getAttribute?.("role");
+
+    if (/^h[1-6]$/.test(tag)) {
+        const t = elementLabel(el);
+        return t ? { tag, text: t } : null;
+    } else if (tag === "a" && el.href) {
+        const t = elementLabel(el);
+        return t.length > 1 ? { tag: "link", text: t } : null;
+    } else if (tag === "button" || role === "button" || (tag === "input" && el.type === "submit")) {
+        const t = elementLabel(el);
+        return t ? { tag: "button", text: t, disabled: el.disabled || undefined } : null;
+    } else if ((tag === "input" && el.type !== "hidden" && el.type !== "submit") || tag === "textarea" || tag === "select") {
+        return {
+            tag: tag === "select" ? "select" : "input",
+            type: el.type || undefined, name: el.name || undefined,
+            placeholder: el.placeholder || undefined, label: elementLabel(el),
+            value: el.value?.slice(0, 60) || undefined, id: el.id || undefined,
+            disabled: el.disabled || undefined,
+        };
+    } else if (el.isContentEditable && el.getAttribute?.("contenteditable") === "true") {
+        return { tag: "editor", text: getVisibleText(el).slice(0, 60) };
+    } else if (role === "tab" || role === "menuitem" || role === "option" || role === "switch" ||
+               role === "checkbox" || role === "radio" || role === "listitem") {
+        const t = getVisibleText(el).slice(0, 60);
+        return t ? { tag: role, text: t, selected: el.getAttribute("aria-selected"), checked: el.getAttribute("aria-checked") } : null;
+    }
+    return null;
+}
+
+function tagElementToRef(el, node, idx) {
+    try { el.setAttribute("data-neo-ref", String(idx)); } catch {}
+    refMap.set(idx, {
+        element: el,
+        tag: node.tag,
+        text: node.text || node.label || "",
+        selector: buildUniqueSelector(el),
+    });
+    node.ref = idx;
+    // Add section context for disambiguation
+    node.section = getSection(el);
+}
+
+/**
+ * Get the nearest landmark/section name for an element.
+ * Returns short context like "nav", "main", "footer", "form#login", "dialog".
+ */
+function getSection(el) {
+    let current = el.parentElement;
+    while (current && current !== document.body) {
+        const tag = current.tagName?.toLowerCase();
+        const role = current.getAttribute?.("role");
+        const id = current.id;
+
+        // Landmark elements
+        if (tag === "nav" || tag === "header" || tag === "footer" || tag === "main" ||
+            tag === "aside" || tag === "dialog" || tag === "form") {
+            return id ? `${tag}#${id}` : tag;
+        }
+        // ARIA landmarks
+        if (role === "navigation" || role === "banner" || role === "contentinfo" ||
+            role === "main" || role === "dialog" || role === "alertdialog" ||
+            role === "complementary" || role === "search" || role === "form") {
+            const label = current.getAttribute("aria-label");
+            return label ? `${role}:${label.slice(0, 20)}` : role;
+        }
+        // Named sections
+        if (tag === "section" && (id || current.getAttribute("aria-label"))) {
+            return id ? `section#${id}` : `section:${current.getAttribute("aria-label").slice(0, 20)}`;
+        }
+        current = current.parentElement;
+    }
+    return null;
+}
+
+function buildUniqueSelector(el) {
+    if (el.id) return `#${CSS.escape(el.id)}`;
+    const ariaLabel = el.getAttribute?.("aria-label");
+    if (ariaLabel) return `[aria-label=${CSS.escape(ariaLabel)}]`;
+    const name = el.getAttribute?.("name");
+    if (name) return `[name=${CSS.escape(name)}]`;
+    const dataTestId = el.getAttribute?.("data-testid");
+    if (dataTestId) return `[data-testid=${CSS.escape(dataTestId)}]`;
+    return null;
+}
+
+function buildDomTree(root, depth, maxDepth, textFilter) {
+    if (depth >= maxDepth) return null;
+    const children = root.children || [];
+    const nodes = [];
+    for (let i = 0; i < children.length && nodes.length < 50; i++) {
+        const el = children[i];
+        if (el.nodeType !== 1) continue;
+        const tag = el.tagName?.toLowerCase();
+        // Skip invisible elements
+        try { if (el.offsetWidth === 0 && el.offsetHeight === 0) continue; } catch {}
+        const text = getVisibleText(el).slice(0, 60);
+        if (textFilter && !textFilter(text)) continue;
+        const node = { tag, id: el.id || undefined, text: text || undefined };
+        const sub = buildDomTree(el, depth + 1, maxDepth, textFilter);
+        if (sub && sub.length > 0) node.children = sub;
+        nodes.push(node);
+    }
+    return nodes;
+}
+
+function readPageFull(maxLength) {
+    const max = maxLength || 15000;
+    return {
+        title: document.title, url: window.location.href,
+        text: document.body.innerText.slice(0, max),
+        links: Array.from(document.querySelectorAll("a[href]")).slice(0, 50)
+            .map((a) => ({ text: getVisibleText(a).slice(0, 40), href: a.href }))
+            .filter((l) => l.text && l.href?.startsWith("http")),
+        inputs: deepQuerySelectorAll(document, "input, textarea, select").slice(0, 30)
+            .map((el) => ({ tag: el.tagName.toLowerCase(), type: el.type, name: el.name, id: el.id, placeholder: el.placeholder })),
+        buttons: deepQuerySelectorAll(document, "button, [role='button'], input[type='submit']").slice(0, 30)
+            .map((el) => ({ text: getVisibleText(el).slice(0, 40), id: el.id })),
+    };
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SCROLL & COLLECT - Auto-scroll to load lazy content, collect text
+// ══════════════════════════════════════════════════════════════════════════════
+
+async function scrollAndCollect(params) {
+    const scrolls = params.scrolls || 5;
+    const waitMs = params.wait_ms || 1500;
+    const pixels = params.amount || 800;
+    const selector = params.selector || null;
+    const query = params.query || null;
+    const maxLength = params.max_length || 15000;
+
+    // Dismiss overlays before scrolling
+    try { dismissOverlays(); } catch {}
+
+    const seenText = new Set();
+    const items = [];
+    let totalLen = 0;
+    let lastHeight = document.body.scrollHeight;
+    let staleCount = 0;
+
+    for (let i = 0; i < scrolls && totalLen < maxLength; i++) {
+        // Try to extract structured cards/posts first
+        const cards = extractCards(selector);
+        for (const card of cards) {
+            const key = card.text?.slice(0, 100) || card.title?.slice(0, 100) || "";
+            if (!key || seenText.has(key)) continue;
+            if (query && !JSON.stringify(card).toLowerCase().includes(query.toLowerCase())) continue;
+            seenText.add(key);
+            items.push(card);
+            totalLen += (card.text || "").length + (card.title || "").length;
+            if (totalLen >= maxLength) break;
+        }
+
+        // Fallback: raw text if no cards found
+        if (cards.length === 0) {
+            const root = selector ? (deepQuerySelector(document, selector) || document.body) : document.body;
+            const text = (root.innerText || "").trim();
+            const paragraphs = text.split("\n").filter((p) => p.trim().length > 20);
+            for (const p of paragraphs) {
+                const trimmed = p.trim();
+                if (seenText.has(trimmed)) continue;
+                if (query && !trimmed.toLowerCase().includes(query.toLowerCase())) continue;
+                seenText.add(trimmed);
+                items.push({ text: trimmed });
+                totalLen += trimmed.length;
+                if (totalLen >= maxLength) break;
+            }
+        }
+
+        // Scroll down
+        window.scrollBy({ top: pixels, behavior: "instant" });
+        await new Promise((r) => setTimeout(r, waitMs));
+
+        // Detect end of list (no new content loaded)
+        const newHeight = document.body.scrollHeight;
+        if (newHeight === lastHeight) {
+            staleCount++;
+            if (staleCount >= 2) break; // stopped loading new content
+        } else {
+            staleCount = 0;
+            lastHeight = newHeight;
+        }
+    }
+
+    return {
+        title: document.title,
+        url: window.location.href,
+        items_found: items.length,
+        items,
+    };
+}
+
+/**
+ * Extract structured cards/posts from the page.
+ * Detects common patterns: feed posts, list items, article cards.
+ * Returns array of { author, text, title, time, engagement }.
+ */
+function extractCards(scopeSelector) {
+    const root = scopeSelector ? (deepQuerySelector(document, scopeSelector) || document.body) : document.body;
+    const cards = [];
+
+    // Common card/post container selectors (LinkedIn, Twitter, Reddit, generic)
+    const cardSelectors = [
+        '[data-urn*="activity"]',           // LinkedIn posts
+        'article',                          // Generic article cards
+        '[role="article"]',                 // ARIA article
+        '[class*="feed-shared-update"]',    // LinkedIn feed
+        '[data-testid*="tweet"]',           // Twitter/X
+        '[class*="Post"]',                  // Reddit, generic
+        '[class*="post"]',                  // Generic
+        '[class*="card"]',                  // Generic cards
+    ];
+
+    let containers = [];
+    for (const sel of cardSelectors) {
+        try {
+            const found = root.querySelectorAll(sel);
+            if (found.length >= 2) { // need at least 2 to be a repeating pattern
+                containers = Array.from(found);
+                break;
+            }
+        } catch {}
+    }
+
+    // Fallback: find repeating sibling elements with similar structure
+    if (containers.length === 0) {
+        const candidates = root.querySelectorAll("li, [class*='item'], [class*='entry']");
+        if (candidates.length >= 3) containers = Array.from(candidates);
+    }
+
+    for (const container of containers.slice(0, 30)) {
+        try {
+            const text = (container.innerText || "").trim();
+            if (text.length < 20 || text.length > 5000) continue;
+
+            const card = {};
+
+            // Extract author (common patterns)
+            const authorEl = container.querySelector('[class*="actor"], [class*="author"], [class*="user"], [rel="author"], [data-testid*="User"]');
+            if (authorEl) card.author = getVisibleText(authorEl).split("\n")[0].trim().slice(0, 60);
+
+            // Extract time
+            const timeEl = container.querySelector("time, [datetime], [class*='time'], [class*='date']");
+            if (timeEl) card.time = (timeEl.getAttribute("datetime") || getVisibleText(timeEl)).slice(0, 30);
+
+            // Extract title (if present)
+            const titleEl = container.querySelector("h1, h2, h3, h4, [class*='title'], [class*='headline']");
+            if (titleEl) card.title = getVisibleText(titleEl).slice(0, 120);
+
+            // Main text — remove nested author/time to avoid duplication
+            const cloned = container.cloneNode(true);
+            cloned.querySelectorAll('[class*="actor"], [class*="author"], time, [datetime], [class*="engagement"], [class*="social-action"], [class*="reaction"]').forEach((el) => el.remove());
+            card.text = (cloned.innerText || "").replace(/\s+/g, " ").trim().slice(0, 500);
+
+            // Engagement metrics
+            const engEl = container.querySelector('[class*="reaction"], [class*="like"], [class*="social-count"], [class*="engagement"]');
+            if (engEl) card.engagement = getVisibleText(engEl).replace(/\s+/g, " ").trim().slice(0, 60);
+
+            if (card.text) cards.push(card);
+        } catch {}
+    }
+
+    return cards;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// STORAGE & JS EXECUTION
+// ══════════════════════════════════════════════════════════════════════════════
+
+function extractLocalStorage(keys) {
+    if (keys?.length > 0) {
+        const result = {};
+        for (const key of keys) result[key] = localStorage.getItem(key);
+        return result;
+    }
+    const all = {};
+    for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        all[key] = localStorage.getItem(key)?.slice(0, 500);
+    }
+    return all;
+}
+
+function extractSessionStorage(keys) {
+    if (keys?.length > 0) {
+        const result = {};
+        for (const key of keys) result[key] = sessionStorage.getItem(key);
+        return result;
+    }
+    const all = {};
+    for (let i = 0; i < sessionStorage.length; i++) {
+        const key = sessionStorage.key(i);
+        all[key] = sessionStorage.getItem(key)?.slice(0, 500);
+    }
+    return all;
+}
+
+function executeJs(code) {
+    try {
+        const fn = new Function("return (" + code + ")");
+        const result = fn();
+        return { result: result !== undefined ? JSON.parse(JSON.stringify(result)) : null };
+    } catch (e) {
+        return { error: e.message };
+    }
+}
+
+function screenshotFull() {
+    return {
+        scrollWidth: document.body.scrollWidth,
+        scrollHeight: document.body.scrollHeight,
+        viewportWidth: window.innerWidth,
+        viewportHeight: window.innerHeight,
+    };
+}
