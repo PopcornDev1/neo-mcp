@@ -97,15 +97,20 @@ function storeAuthInMemory(service: string, creds: Record<string, string>) {
     memCredentials.set(service, { ...existing, ...creds });
 }
 
-function getLinkedInAuth(): linkedin.LinkedInAuth {
-    const creds = getAuth("linkedin");
-    if (!creds.li_at) throw new Error("Missing li_at token. Run extract_auth for linkedin.");
+/** Build the credential service key, e.g. "linkedin" or "linkedin:business" */
+function profileKey(service: string, profile?: string): string {
+    return profile ? `${service}:${profile}` : service;
+}
+
+function getLinkedInAuth(profile?: string): linkedin.LinkedInAuth {
+    const creds = getAuth(profileKey("linkedin", profile));
+    if (!creds.li_at) throw new Error(`Missing li_at token. Run extract_auth for linkedin${profile ? ` (profile: ${profile})` : ""}.`);
     return { li_at: creds.li_at, jsessionid: creds.jsessionid || "" };
 }
 
-function getTwitterAuth(): twitter.TwitterAuth {
-    const creds = getAuth("twitter");
-    if (!creds.auth_token) throw new Error("Missing auth_token. Run extract_auth for twitter.");
+function getTwitterAuth(profile?: string): twitter.TwitterAuth {
+    const creds = getAuth(profileKey("twitter", profile));
+    if (!creds.auth_token) throw new Error(`Missing auth_token. Run extract_auth for twitter${profile ? ` (profile: ${profile})` : ""}.`);
     return { auth_token: creds.auth_token, csrf_token: creds.csrf_token || "" };
 }
 
@@ -114,22 +119,27 @@ function getTwitterAuth(): twitter.TwitterAuth {
 
 server.tool(
     "extract_auth",
-    "Extract auth tokens from the user's logged-in browser session. Supports: slack, discord, linkedin, twitter, github, notion, or any domain. Tokens are stored automatically for future API calls.",
-    { service: z.string().describe("Service name or domain") },
-    async ({ service }) => {
+    "Extract auth tokens from the user's logged-in browser session. Supports: slack, discord, linkedin, twitter, github, notion, or any domain. Tokens are stored automatically for future API calls. Use the profile parameter to store credentials under a named profile (e.g. profile='business' stores as 'linkedin:business').",
+    {
+        service: z.string().describe("Service name or domain"),
+        profile: z.string().optional().describe("Profile name (e.g. 'personal', 'business'). Omit to use the default profile."),
+    },
+    async ({ service, profile }) => {
         if (!isBridgeConnected()) {
             return { content: [{ type: "text", text: "Browser extension not connected. Install the Neo Bridge extension and make sure Chrome is running." }] };
         }
         const result = await browserCommand("extract_auth", { service });
+        const storageKey = profileKey(service, profile);
         // Store extracted tokens in db + in-memory fallback
         const creds: Record<string, string> = {};
         for (const [key, value] of Object.entries(result)) {
             if (key === "service" || key === "cookies" || !value || typeof value !== "string") continue;
             creds[key] = value as string;
-            try { db.storeCredential(service, key, value as string); } catch {}
+            try { db.storeCredential(storageKey, key, value as string); } catch {}
         }
-        storeAuthInMemory(service, creds);
-        return { content: [{ type: "text", text: json(result) }] };
+        storeAuthInMemory(storageKey, creds);
+        const label = profile ? ` as profile "${profile}"` : "";
+        return { content: [{ type: "text", text: `Stored${label}.\n${json(result)}` }] };
     }
 );
 
@@ -231,12 +241,14 @@ server.tool(
 
 // ── LinkedIn ─────────────────────────────────────────────────────────────────
 
+const profileParam = { profile: z.string().optional().describe("Credential profile to use (e.g. 'personal', 'business'). Omit for default.") };
+
 server.tool(
     "linkedin_profile",
     "Get a LinkedIn user's profile. Pass the vanity name (URL slug, e.g. 'nirupambhowmick').",
-    { vanity_name: z.string() },
-    async ({ vanity_name }) => {
-        const result = await linkedin.getProfile(getLinkedInAuth(), vanity_name);
+    { vanity_name: z.string(), ...profileParam },
+    async ({ vanity_name, profile }) => {
+        const result = await linkedin.getProfile(getLinkedInAuth(profile), vanity_name);
         return { content: [{ type: "text", text: json(result) }] };
     }
 );
@@ -244,9 +256,9 @@ server.tool(
 server.tool(
     "linkedin_my_posts",
     "Get your own LinkedIn posts with engagement metrics (likes, comments, reposts, impressions).",
-    { count: z.number().optional().describe("Number of posts (default 20)") },
-    async ({ count }) => {
-        const posts = await linkedin.getMyPosts(getLinkedInAuth(), count || 20);
+    { count: z.number().optional().describe("Number of posts (default 20)"), ...profileParam },
+    async ({ count, profile }) => {
+        const posts = await linkedin.getMyPosts(getLinkedInAuth(profile), count || 20);
         return { content: [{ type: "text", text: json(posts) }] };
     }
 );
@@ -254,9 +266,9 @@ server.tool(
 server.tool(
     "linkedin_feed",
     "Get your LinkedIn feed.",
-    { count: z.number().optional().describe("Number of posts (default 20)") },
-    async ({ count }) => {
-        const posts = await linkedin.getFeed(getLinkedInAuth(), count || 20);
+    { count: z.number().optional().describe("Number of posts (default 20)"), ...profileParam },
+    async ({ count, profile }) => {
+        const posts = await linkedin.getFeed(getLinkedInAuth(profile), count || 20);
         return { content: [{ type: "text", text: json(posts) }] };
     }
 );
@@ -264,9 +276,9 @@ server.tool(
 server.tool(
     "linkedin_post",
     "Create a LinkedIn post.",
-    { text: z.string().describe("Post content") },
-    async ({ text }) => {
-        const result = await linkedin.createPost(getLinkedInAuth(), text);
+    { text: z.string().describe("Post content"), ...profileParam },
+    async ({ text, profile }) => {
+        const result = await linkedin.createPost(getLinkedInAuth(profile), text);
         return { content: [{ type: "text", text: json(result) }] };
     }
 );
@@ -274,12 +286,9 @@ server.tool(
 server.tool(
     "linkedin_search",
     "Search for people on LinkedIn.",
-    {
-        query: z.string(),
-        count: z.number().optional(),
-    },
-    async ({ query, count }) => {
-        const results = await linkedin.searchPeople(getLinkedInAuth(), query, count || 10);
+    { query: z.string(), count: z.number().optional(), ...profileParam },
+    async ({ query, count, profile }) => {
+        const results = await linkedin.searchPeople(getLinkedInAuth(profile), query, count || 10);
         return { content: [{ type: "text", text: json(results) }] };
     }
 );
@@ -287,9 +296,9 @@ server.tool(
 server.tool(
     "linkedin_connections",
     "List your LinkedIn connections.",
-    { count: z.number().optional() },
-    async ({ count }) => {
-        const results = await linkedin.getConnections(getLinkedInAuth(), count || 50);
+    { count: z.number().optional(), ...profileParam },
+    async ({ count, profile }) => {
+        const results = await linkedin.getConnections(getLinkedInAuth(profile), count || 50);
         return { content: [{ type: "text", text: json(results) }] };
     }
 );
@@ -299,9 +308,9 @@ server.tool(
 server.tool(
     "twitter_profile",
     "Get a Twitter/X user's profile.",
-    { screen_name: z.string() },
-    async ({ screen_name }) => {
-        const result = await twitter.getProfile(getTwitterAuth(), screen_name);
+    { screen_name: z.string(), ...profileParam },
+    async ({ screen_name, profile }) => {
+        const result = await twitter.getProfile(getTwitterAuth(profile), screen_name);
         return { content: [{ type: "text", text: json(result) }] };
     }
 );
@@ -309,12 +318,9 @@ server.tool(
 server.tool(
     "twitter_user_tweets",
     "Get a user's tweets with engagement metrics.",
-    {
-        screen_name: z.string(),
-        count: z.number().optional(),
-    },
-    async ({ screen_name, count }) => {
-        const tweets = await twitter.getUserTweets(getTwitterAuth(), screen_name, count || 20);
+    { screen_name: z.string(), count: z.number().optional(), ...profileParam },
+    async ({ screen_name, count, profile }) => {
+        const tweets = await twitter.getUserTweets(getTwitterAuth(profile), screen_name, count || 20);
         return { content: [{ type: "text", text: json(tweets) }] };
     }
 );
@@ -322,9 +328,9 @@ server.tool(
 server.tool(
     "twitter_timeline",
     "Get your home timeline.",
-    { count: z.number().optional() },
-    async ({ count }) => {
-        const tweets = await twitter.getTimeline(getTwitterAuth(), count || 20);
+    { count: z.number().optional(), ...profileParam },
+    async ({ count, profile }) => {
+        const tweets = await twitter.getTimeline(getTwitterAuth(profile), count || 20);
         return { content: [{ type: "text", text: json(tweets) }] };
     }
 );
@@ -332,12 +338,9 @@ server.tool(
 server.tool(
     "twitter_post",
     "Post a tweet. Optionally reply to another tweet.",
-    {
-        text: z.string(),
-        reply_to: z.string().optional().describe("Tweet ID to reply to"),
-    },
-    async ({ text, reply_to }) => {
-        const result = await twitter.createTweet(getTwitterAuth(), text, reply_to);
+    { text: z.string(), reply_to: z.string().optional().describe("Tweet ID to reply to"), ...profileParam },
+    async ({ text, reply_to, profile }) => {
+        const result = await twitter.createTweet(getTwitterAuth(profile), text, reply_to);
         return { content: [{ type: "text", text: json(result) }] };
     }
 );
@@ -345,12 +348,9 @@ server.tool(
 server.tool(
     "twitter_search",
     "Search tweets.",
-    {
-        query: z.string(),
-        count: z.number().optional(),
-    },
-    async ({ query, count }) => {
-        const tweets = await twitter.searchTweets(getTwitterAuth(), query, count || 20);
+    { query: z.string(), count: z.number().optional(), ...profileParam },
+    async ({ query, count, profile }) => {
+        const tweets = await twitter.searchTweets(getTwitterAuth(profile), query, count || 20);
         return { content: [{ type: "text", text: json(tweets) }] };
     }
 );
@@ -518,6 +518,165 @@ server.tool(
     async ({ service, key, value }) => {
         db.storeCredential(service, key, value);
         return { content: [{ type: "text", text: `Stored ${key} for ${service}.` }] };
+    }
+);
+
+server.tool(
+    "list_profiles",
+    "List all stored profiles for a service. Profiles are named credential sets (e.g. linkedin:personal, linkedin:business). The default profile has no suffix.",
+    { service: z.string().describe("Service name, e.g. 'linkedin' or 'twitter'") },
+    async ({ service }) => {
+        const profiles = db.listProfiles(service);
+        if (profiles.length === 0) return { content: [{ type: "text", text: `No credentials stored for "${service}".` }] };
+        return { content: [{ type: "text", text: json(profiles) }] };
+    }
+);
+
+// ── Analytics ────────────────────────────────────────────────────────────────
+
+const ANALYTICS_COLLECTION = "neo_analytics";
+
+function ensureAnalyticsCollection() {
+    try {
+        db.createCollection(ANALYTICS_COLLECTION, "Tracked social media posts for ongoing analytics monitoring", [
+            { name: "service", type: "text", description: "linkedin or twitter" },
+            { name: "post_id", type: "text", description: "Platform post ID" },
+            { name: "post_url", type: "text", description: "URL of the post" },
+            { name: "post_text", type: "text", description: "Post content snippet" },
+            { name: "likes", type: "number", description: "Like count at last check" },
+            { name: "comments", type: "number", description: "Comment count at last check" },
+            { name: "shares", type: "number", description: "Share/repost count at last check" },
+            { name: "impressions", type: "number", description: "Impression count at last check" },
+            { name: "profile", type: "text", description: "Credential profile used" },
+            { name: "tracked_at", type: "date", description: "When tracking started" },
+            { name: "last_checked_at", type: "date", description: "Last time metrics were refreshed" },
+        ]);
+    } catch {
+        // Collection already exists — that's fine
+    }
+}
+
+server.tool(
+    "content_monitor",
+    "Fetch analytics on your recent posts for a service (linkedin or twitter). Returns engagement rates, best performing posts, and totals. For Twitter, pass your screen_name (handle) to fetch your own tweets.",
+    { service: z.enum(["linkedin", "twitter"]), screen_name: z.string().optional().describe("Your Twitter screen name / handle (required for twitter service)"), count: z.number().optional().describe("Number of recent posts to analyse (default 20)"), ...profileParam },
+    async ({ service, screen_name, count, profile }) => {
+        if (service === "twitter" && !screen_name) {
+            return { content: [{ type: "text", text: "screen_name is required for twitter. Pass your Twitter handle (e.g. screen_name='elonmusk')." }] };
+        }
+        const posts = service === "linkedin"
+            ? await linkedin.getMyPosts(getLinkedInAuth(profile), count || 20)
+            : await twitter.getUserTweets(getTwitterAuth(profile), screen_name!, count || 20);
+
+        const items = Array.isArray(posts) ? posts : [];
+        if (items.length === 0) return { content: [{ type: "text", text: "No posts found." }] };
+
+        const metrics = items.map((p: any) => ({
+            id: p.id || p.tweet_id,
+            text: (p.text || p.content || "").slice(0, 120),
+            likes: Number(p.likes || p.like_count || 0),
+            comments: Number(p.comments || p.comment_count || p.reply_count || 0),
+            shares: Number(p.shares || p.reposts || p.repost_count || p.retweet_count || 0),
+            impressions: Number(p.impressions || p.impression_count || 0),
+            posted_at: p.created_at || p.postedAt || "",
+        }));
+
+        const totalLikes = metrics.reduce((s: number, p: any) => s + p.likes, 0);
+        const totalComments = metrics.reduce((s: number, p: any) => s + p.comments, 0);
+        const totalShares = metrics.reduce((s: number, p: any) => s + p.shares, 0);
+        const best = [...metrics].sort((a: any, b: any) => (b.likes + b.comments + b.shares) - (a.likes + a.comments + a.shares)).slice(0, 3);
+
+        const report = {
+            service,
+            profile: profile || "default",
+            posts_analysed: metrics.length,
+            totals: { likes: totalLikes, comments: totalComments, shares: totalShares },
+            averages: {
+                likes: (totalLikes / metrics.length).toFixed(1),
+                comments: (totalComments / metrics.length).toFixed(1),
+                shares: (totalShares / metrics.length).toFixed(1),
+            },
+            top_posts: best,
+            all_posts: metrics,
+        };
+
+        return { content: [{ type: "text", text: json(report) }] };
+    }
+);
+
+server.tool(
+    "track_post",
+    "Add a post to the analytics tracking collection for ongoing monitoring. Stores current engagement metrics in the neo_analytics collection.",
+    {
+        service: z.enum(["linkedin", "twitter"]),
+        post_id: z.string().describe("Post ID or tweet ID"),
+        post_url: z.string().optional().describe("URL of the post"),
+        post_text: z.string().optional().describe("Post content snippet"),
+        likes: z.number().optional(),
+        comments: z.number().optional(),
+        shares: z.number().optional(),
+        impressions: z.number().optional(),
+        ...profileParam,
+    },
+    async ({ service, post_id, post_url, post_text, likes, comments, shares, impressions, profile }) => {
+        ensureAnalyticsCollection();
+        const now = new Date().toISOString();
+        const result = db.collectionInsert(ANALYTICS_COLLECTION, {
+            service,
+            post_id,
+            post_url: post_url || "",
+            post_text: (post_text || "").slice(0, 500),
+            likes: likes || 0,
+            comments: comments || 0,
+            shares: shares || 0,
+            impressions: impressions || 0,
+            profile: profile || "default",
+            tracked_at: now,
+            last_checked_at: now,
+        });
+        return { content: [{ type: "text", text: `Tracking post ${post_id} (id=${result.id}).` }] };
+    }
+);
+
+server.tool(
+    "analytics_report",
+    "Generate a summary report of all tracked posts' performance. Shows engagement totals, averages, and top performers. Uses the neo_analytics collection.",
+    { service: z.enum(["linkedin", "twitter"]).optional().describe("Filter by service (omit for all)"), ...profileParam },
+    async ({ service, profile }) => {
+        ensureAnalyticsCollection();
+        const where: Record<string, any> = {};
+        if (service) where.service = service;
+        if (profile) where.profile = profile;
+        const rows = db.collectionQuery(ANALYTICS_COLLECTION, { where: Object.keys(where).length ? where : undefined, limit: 500, orderBy: "created_at DESC" });
+
+        if (rows.length === 0) return { content: [{ type: "text", text: "No tracked posts yet. Use track_post to start monitoring." }] };
+
+        // Group by service
+        const byService: Record<string, any[]> = {};
+        for (const row of rows) {
+            if (!byService[row.service]) byService[row.service] = [];
+            byService[row.service].push(row);
+        }
+
+        const summary: Record<string, any> = {};
+        for (const [svc, posts] of Object.entries(byService)) {
+            const totalLikes = posts.reduce((s, p) => s + (p.likes || 0), 0);
+            const totalComments = posts.reduce((s, p) => s + (p.comments || 0), 0);
+            const totalShares = posts.reduce((s, p) => s + (p.shares || 0), 0);
+            const best = [...posts].sort((a, b) => (b.likes + b.comments + b.shares) - (a.likes + a.comments + a.shares)).slice(0, 3);
+            summary[svc] = {
+                tracked_posts: posts.length,
+                totals: { likes: totalLikes, comments: totalComments, shares: totalShares },
+                averages: {
+                    likes: (totalLikes / posts.length).toFixed(1),
+                    comments: (totalComments / posts.length).toFixed(1),
+                    shares: (totalShares / posts.length).toFixed(1),
+                },
+                top_posts: best.map((p) => ({ id: p.post_id, text: p.post_text, likes: p.likes, comments: p.comments, shares: p.shares, tracked_at: p.tracked_at })),
+            };
+        }
+
+        return { content: [{ type: "text", text: json({ generated_at: new Date().toISOString(), filter: { service, profile }, ...summary }) }] };
     }
 );
 
@@ -803,21 +962,23 @@ function registerAllTools(s: McpServer) {
     // Auth extraction
     s.tool(
         "extract_auth",
-        "Extract auth tokens from the user's logged-in browser session. Supports: slack, discord, linkedin, twitter, github, notion, or any domain.",
-        { service: z.string().describe("Service name or domain") },
-        async ({ service }) => {
+        "Extract auth tokens from the user's logged-in browser session. Supports: slack, discord, linkedin, twitter, github, notion, or any domain. Use profile to store credentials under a named profile.",
+        { service: z.string().describe("Service name or domain"), profile: z.string().optional().describe("Profile name (e.g. 'personal', 'business'). Omit for default.") },
+        async ({ service, profile }) => {
             if (!isBridgeConnected()) {
                 return { content: [{ type: "text", text: "Browser extension not connected. Install the Neo Bridge extension and make sure Chrome is running." }] };
             }
             const result = await browserCommand("extract_auth", { service });
+            const storageKey = profileKey(service, profile);
             const creds: Record<string, string> = {};
             for (const [key, value] of Object.entries(result)) {
                 if (key === "service" || key === "cookies" || !value || typeof value !== "string") continue;
                 creds[key] = value as string;
-                try { db.storeCredential(service, key, value as string); } catch {}
+                try { db.storeCredential(storageKey, key, value as string); } catch {}
             }
-            storeAuthInMemory(service, creds);
-            return { content: [{ type: "text", text: json(result) }] };
+            storeAuthInMemory(storageKey, creds);
+            const label = profile ? ` as profile "${profile}"` : "";
+            return { content: [{ type: "text", text: `Stored${label}.\n${json(result)}` }] };
         }
     );
 
@@ -877,30 +1038,30 @@ function registerAllTools(s: McpServer) {
     );
 
     // LinkedIn
-    s.tool("linkedin_profile", "Get a LinkedIn user's profile.", { vanity_name: z.string() },
-        async ({ vanity_name }) => ({ content: [{ type: "text", text: json(await linkedin.getProfile(getLinkedInAuth(), vanity_name)) }] }));
-    s.tool("linkedin_my_posts", "Get your own LinkedIn posts with engagement metrics.", { count: z.number().optional() },
-        async ({ count }) => ({ content: [{ type: "text", text: json(await linkedin.getMyPosts(getLinkedInAuth(), count || 20)) }] }));
-    s.tool("linkedin_feed", "Get your LinkedIn feed.", { count: z.number().optional() },
-        async ({ count }) => ({ content: [{ type: "text", text: json(await linkedin.getFeed(getLinkedInAuth(), count || 20)) }] }));
-    s.tool("linkedin_post", "Create a LinkedIn post.", { text: z.string() },
-        async ({ text }) => ({ content: [{ type: "text", text: json(await linkedin.createPost(getLinkedInAuth(), text)) }] }));
-    s.tool("linkedin_search", "Search for people on LinkedIn.", { query: z.string(), count: z.number().optional() },
-        async ({ query, count }) => ({ content: [{ type: "text", text: json(await linkedin.searchPeople(getLinkedInAuth(), query, count || 10)) }] }));
-    s.tool("linkedin_connections", "List your LinkedIn connections.", { count: z.number().optional() },
-        async ({ count }) => ({ content: [{ type: "text", text: json(await linkedin.getConnections(getLinkedInAuth(), count || 50)) }] }));
+    s.tool("linkedin_profile", "Get a LinkedIn user's profile.", { vanity_name: z.string(), ...profileParam },
+        async ({ vanity_name, profile }) => ({ content: [{ type: "text", text: json(await linkedin.getProfile(getLinkedInAuth(profile), vanity_name)) }] }));
+    s.tool("linkedin_my_posts", "Get your own LinkedIn posts with engagement metrics.", { count: z.number().optional(), ...profileParam },
+        async ({ count, profile }) => ({ content: [{ type: "text", text: json(await linkedin.getMyPosts(getLinkedInAuth(profile), count || 20)) }] }));
+    s.tool("linkedin_feed", "Get your LinkedIn feed.", { count: z.number().optional(), ...profileParam },
+        async ({ count, profile }) => ({ content: [{ type: "text", text: json(await linkedin.getFeed(getLinkedInAuth(profile), count || 20)) }] }));
+    s.tool("linkedin_post", "Create a LinkedIn post.", { text: z.string(), ...profileParam },
+        async ({ text, profile }) => ({ content: [{ type: "text", text: json(await linkedin.createPost(getLinkedInAuth(profile), text)) }] }));
+    s.tool("linkedin_search", "Search for people on LinkedIn.", { query: z.string(), count: z.number().optional(), ...profileParam },
+        async ({ query, count, profile }) => ({ content: [{ type: "text", text: json(await linkedin.searchPeople(getLinkedInAuth(profile), query, count || 10)) }] }));
+    s.tool("linkedin_connections", "List your LinkedIn connections.", { count: z.number().optional(), ...profileParam },
+        async ({ count, profile }) => ({ content: [{ type: "text", text: json(await linkedin.getConnections(getLinkedInAuth(profile), count || 50)) }] }));
 
     // Twitter
-    s.tool("twitter_profile", "Get a Twitter/X user's profile.", { screen_name: z.string() },
-        async ({ screen_name }) => ({ content: [{ type: "text", text: json(await twitter.getProfile(getTwitterAuth(), screen_name)) }] }));
-    s.tool("twitter_user_tweets", "Get a user's tweets with engagement metrics.", { screen_name: z.string(), count: z.number().optional() },
-        async ({ screen_name, count }) => ({ content: [{ type: "text", text: json(await twitter.getUserTweets(getTwitterAuth(), screen_name, count || 20)) }] }));
-    s.tool("twitter_timeline", "Get your home timeline.", { count: z.number().optional() },
-        async ({ count }) => ({ content: [{ type: "text", text: json(await twitter.getTimeline(getTwitterAuth(), count || 20)) }] }));
-    s.tool("twitter_post", "Post a tweet.", { text: z.string(), reply_to: z.string().optional() },
-        async ({ text, reply_to }) => ({ content: [{ type: "text", text: json(await twitter.createTweet(getTwitterAuth(), text, reply_to)) }] }));
-    s.tool("twitter_search", "Search tweets.", { query: z.string(), count: z.number().optional() },
-        async ({ query, count }) => ({ content: [{ type: "text", text: json(await twitter.searchTweets(getTwitterAuth(), query, count || 20)) }] }));
+    s.tool("twitter_profile", "Get a Twitter/X user's profile.", { screen_name: z.string(), ...profileParam },
+        async ({ screen_name, profile }) => ({ content: [{ type: "text", text: json(await twitter.getProfile(getTwitterAuth(profile), screen_name)) }] }));
+    s.tool("twitter_user_tweets", "Get a user's tweets with engagement metrics.", { screen_name: z.string(), count: z.number().optional(), ...profileParam },
+        async ({ screen_name, count, profile }) => ({ content: [{ type: "text", text: json(await twitter.getUserTweets(getTwitterAuth(profile), screen_name, count || 20)) }] }));
+    s.tool("twitter_timeline", "Get your home timeline.", { count: z.number().optional(), ...profileParam },
+        async ({ count, profile }) => ({ content: [{ type: "text", text: json(await twitter.getTimeline(getTwitterAuth(profile), count || 20)) }] }));
+    s.tool("twitter_post", "Post a tweet.", { text: z.string(), reply_to: z.string().optional(), ...profileParam },
+        async ({ text, reply_to, profile }) => ({ content: [{ type: "text", text: json(await twitter.createTweet(getTwitterAuth(profile), text, reply_to)) }] }));
+    s.tool("twitter_search", "Search tweets.", { query: z.string(), count: z.number().optional(), ...profileParam },
+        async ({ query, count, profile }) => ({ content: [{ type: "text", text: json(await twitter.searchTweets(getTwitterAuth(profile), query, count || 20)) }] }));
 
     // Collections
     s.tool("collection_create", "Create a new data collection.", {
@@ -927,6 +1088,52 @@ function registerAllTools(s: McpServer) {
         async () => ({ content: [{ type: "text", text: json(db.listConnectedServices()) }] }));
     s.tool("store_credential", "Manually store a credential for a service.", { service: z.string(), key: z.string(), value: z.string() },
         async ({ service, key, value }) => { db.storeCredential(service, key, value); return { content: [{ type: "text", text: `Stored ${key} for ${service}.` }] }; });
+    s.tool("list_profiles", "List all stored profiles for a service.", { service: z.string().describe("Service name, e.g. 'linkedin' or 'twitter'") },
+        async ({ service }) => {
+            const profiles = db.listProfiles(service);
+            return { content: [{ type: "text", text: profiles.length === 0 ? `No credentials stored for "${service}".` : json(profiles) }] };
+        });
+
+    // Analytics
+    s.tool("content_monitor", "Fetch analytics on your recent posts for a service. For Twitter, pass your screen_name.", { service: z.enum(["linkedin", "twitter"]), screen_name: z.string().optional().describe("Your Twitter handle (required for twitter)"), count: z.number().optional(), ...profileParam },
+        async ({ service, screen_name, count, profile }) => {
+            if (service === "twitter" && !screen_name) return { content: [{ type: "text", text: "screen_name is required for twitter." }] };
+            const posts = service === "linkedin"
+                ? await linkedin.getMyPosts(getLinkedInAuth(profile), count || 20)
+                : await twitter.getUserTweets(getTwitterAuth(profile), screen_name!, count || 20);
+            const items = Array.isArray(posts) ? posts : [];
+            if (items.length === 0) return { content: [{ type: "text", text: "No posts found." }] };
+            const metrics = items.map((p: any) => ({ id: p.id || p.tweet_id, text: (p.text || p.content || "").slice(0, 120), likes: Number(p.likes || p.like_count || 0), comments: Number(p.comments || p.comment_count || p.reply_count || 0), shares: Number(p.shares || p.reposts || p.repost_count || p.retweet_count || 0), impressions: Number(p.impressions || p.impression_count || 0), posted_at: p.created_at || p.postedAt || "" }));
+            const totalLikes = metrics.reduce((s: number, p: any) => s + p.likes, 0);
+            const totalComments = metrics.reduce((s: number, p: any) => s + p.comments, 0);
+            const totalShares = metrics.reduce((s: number, p: any) => s + p.shares, 0);
+            const best = [...metrics].sort((a: any, b: any) => (b.likes + b.comments + b.shares) - (a.likes + a.comments + a.shares)).slice(0, 3);
+            return { content: [{ type: "text", text: json({ service, profile: profile || "default", posts_analysed: metrics.length, totals: { likes: totalLikes, comments: totalComments, shares: totalShares }, averages: { likes: (totalLikes / metrics.length).toFixed(1), comments: (totalComments / metrics.length).toFixed(1), shares: (totalShares / metrics.length).toFixed(1) }, top_posts: best, all_posts: metrics }) }] };
+        });
+    s.tool("track_post", "Add a post to the analytics tracking collection.", { service: z.enum(["linkedin", "twitter"]), post_id: z.string(), post_url: z.string().optional(), post_text: z.string().optional(), likes: z.number().optional(), comments: z.number().optional(), shares: z.number().optional(), impressions: z.number().optional(), ...profileParam },
+        async ({ service, post_id, post_url, post_text, likes, comments, shares, impressions, profile }) => {
+            ensureAnalyticsCollection();
+            const now = new Date().toISOString();
+            const result = db.collectionInsert(ANALYTICS_COLLECTION, { service, post_id, post_url: post_url || "", post_text: (post_text || "").slice(0, 500), likes: likes || 0, comments: comments || 0, shares: shares || 0, impressions: impressions || 0, profile: profile || "default", tracked_at: now, last_checked_at: now });
+            return { content: [{ type: "text", text: `Tracking post ${post_id} (id=${result.id}).` }] };
+        });
+    s.tool("analytics_report", "Generate a summary report of all tracked posts' performance.", { service: z.enum(["linkedin", "twitter"]).optional(), ...profileParam },
+        async ({ service, profile }) => {
+            ensureAnalyticsCollection();
+            const where: Record<string, any> = {};
+            if (service) where.service = service;
+            if (profile) where.profile = profile;
+            const rows = db.collectionQuery(ANALYTICS_COLLECTION, { where: Object.keys(where).length ? where : undefined, limit: 500, orderBy: "created_at DESC" });
+            if (rows.length === 0) return { content: [{ type: "text", text: "No tracked posts yet. Use track_post to start monitoring." }] };
+            const byService: Record<string, any[]> = {};
+            for (const row of rows) { if (!byService[row.service]) byService[row.service] = []; byService[row.service].push(row); }
+            const summary: Record<string, any> = {};
+            for (const [svc, posts] of Object.entries(byService)) {
+                const tl = posts.reduce((s, p) => s + (p.likes || 0), 0), tc = posts.reduce((s, p) => s + (p.comments || 0), 0), ts = posts.reduce((s, p) => s + (p.shares || 0), 0);
+                summary[svc] = { tracked_posts: posts.length, totals: { likes: tl, comments: tc, shares: ts }, averages: { likes: (tl / posts.length).toFixed(1), comments: (tc / posts.length).toFixed(1), shares: (ts / posts.length).toFixed(1) }, top_posts: [...posts].sort((a, b) => (b.likes + b.comments + b.shares) - (a.likes + a.comments + a.shares)).slice(0, 3).map((p) => ({ id: p.post_id, text: p.post_text, likes: p.likes, comments: p.comments, shares: p.shares, tracked_at: p.tracked_at })) };
+            }
+            return { content: [{ type: "text", text: json({ generated_at: new Date().toISOString(), filter: { service, profile }, ...summary }) }] };
+        });
 
     // Dynamic tools
     s.tool("create_tool", "Create a new MCP tool that persists across restarts.", {
