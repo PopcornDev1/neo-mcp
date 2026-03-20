@@ -12,7 +12,10 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
+import express from "express";
+import { randomUUID } from "node:crypto";
 import * as linkedin from "./integrations/linkedin.js";
 import * as twitter from "./integrations/twitter.js";
 import * as db from "./db.js";
@@ -682,6 +685,9 @@ server.tool(
 
 // ── Start ────────────────────────────────────────────────────────────────────
 
+const useHttp = process.env.NEO_TRANSPORT === "http" || process.argv.includes("--http");
+const httpPort = parseInt(process.env.NEO_HTTP_PORT || "3100", 10);
+
 async function main() {
     // Start WebSocket server for browser extension
     await startBridge();
@@ -701,8 +707,229 @@ async function main() {
         }
     }
 
-    const transport = new StdioServerTransport();
-    await server.connect(transport);
+    if (useHttp) {
+        // ── HTTP Streamable transport (for Cowork / remote clients) ──────────
+        const app = express();
+
+        // Track transports per session so we can route messages correctly
+        const transports = new Map<string, StreamableHTTPServerTransport>();
+
+        app.post("/mcp", async (req, res) => {
+            // Check for existing session
+            const sessionId = req.headers["mcp-session-id"] as string | undefined;
+            let transport: StreamableHTTPServerTransport;
+
+            if (sessionId && transports.has(sessionId)) {
+                // Reuse existing transport for this session
+                transport = transports.get(sessionId)!;
+            } else if (!sessionId) {
+                // New session — create transport and connect a fresh server
+                transport = new StreamableHTTPServerTransport({
+                    sessionIdGenerator: () => randomUUID(),
+                });
+                transport.onclose = () => {
+                    if (transport.sessionId) transports.delete(transport.sessionId);
+                };
+                // Each HTTP session gets its own server instance with all the same tools
+                const sessionServer = new McpServer(
+                    { name: "neo", version: "1.0.0" },
+                    { instructions: NEO_INSTRUCTIONS },
+                );
+                registerAllTools(sessionServer);
+                await sessionServer.connect(transport);
+                if (transport.sessionId) transports.set(transport.sessionId, transport);
+            } else {
+                // Invalid session ID
+                res.status(400).json({ error: "Invalid or expired session" });
+                return;
+            }
+
+            await transport.handleRequest(req, res, req.body);
+        });
+
+        // SSE stream endpoint for server-to-client notifications
+        app.get("/mcp", async (req, res) => {
+            const sessionId = req.headers["mcp-session-id"] as string | undefined;
+            if (!sessionId || !transports.has(sessionId)) {
+                res.status(400).json({ error: "Invalid or missing session ID" });
+                return;
+            }
+            await transports.get(sessionId)!.handleRequest(req, res);
+        });
+
+        // Session cleanup
+        app.delete("/mcp", async (req, res) => {
+            const sessionId = req.headers["mcp-session-id"] as string | undefined;
+            if (sessionId && transports.has(sessionId)) {
+                await transports.get(sessionId)!.close();
+                transports.delete(sessionId);
+            }
+            res.status(200).end();
+        });
+
+        app.listen(httpPort, "0.0.0.0", () => {
+            console.error(`[neo-mcp] HTTP transport listening on http://0.0.0.0:${httpPort}/mcp`);
+            console.error(`[neo-mcp] Add to Cowork/Claude config as: { "url": "http://localhost:${httpPort}/mcp" }`);
+        });
+    } else {
+        // ── Stdio transport (for Claude Desktop) ────────────────────────────
+        const transport = new StdioServerTransport();
+        await server.connect(transport);
+    }
+}
+
+/**
+ * Register all built-in tools on a server instance.
+ * Used for HTTP mode where each session gets its own McpServer.
+ * In stdio mode, tools are registered on the module-level `server` directly (above).
+ */
+function registerAllTools(s: McpServer) {
+    // Auth extraction
+    s.tool(
+        "extract_auth",
+        "Extract auth tokens from the user's logged-in browser session. Supports: slack, discord, linkedin, twitter, github, notion, or any domain.",
+        { service: z.string().describe("Service name or domain") },
+        async ({ service }) => {
+            if (!isBridgeConnected()) {
+                return { content: [{ type: "text", text: "Browser extension not connected. Install the Neo Bridge extension and make sure Chrome is running." }] };
+            }
+            const result = await browserCommand("extract_auth", { service });
+            for (const [key, value] of Object.entries(result)) {
+                if (key === "service" || key === "cookies" || !value || typeof value !== "string") continue;
+                db.storeCredential(service, key, value as string);
+            }
+            return { content: [{ type: "text", text: json(result) }] };
+        }
+    );
+
+    // Authenticated fetch
+    s.tool(
+        "authenticated_fetch",
+        `Make an HTTP request from the browser's context, carrying the page's cookies, auth, and session. Works on ANY website the user is logged into.`,
+        {
+            url: z.string().describe("URL to fetch"),
+            method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE"]).optional(),
+            headers: z.record(z.string(), z.string()).optional(),
+            body: z.string().optional(),
+        },
+        async ({ url, method, headers, body }) => {
+            if (!isBridgeConnected()) {
+                return { content: [{ type: "text", text: "Browser extension not connected." }] };
+            }
+            const result = await browserCommand("browser_fetch", { url, method, headers, body, credentials: "include" });
+            const text = typeof result === "string" ? result : json(result);
+            return { content: [{ type: "text", text: text.slice(0, 50000) }] };
+        }
+    );
+
+    // Network capture
+    s.tool("network_capture", "Start/stop/clear network request capture in the browser.",
+        { action: z.enum(["start", "stop", "clear"]), filters: z.array(z.string()).optional(), navigate: z.string().optional() },
+        async ({ action, filters, navigate }) => {
+            if (!isBridgeConnected()) return { content: [{ type: "text", text: "Browser extension not connected." }] };
+            if (action === "start") { await browserCommand("network_start_capture", { filters: filters || [] }); if (navigate) await browserCommand("navigate", { url: navigate }); return { content: [{ type: "text", text: "Capture started." }] }; }
+            if (action === "stop") { await browserCommand("network_stop_capture"); return { content: [{ type: "text", text: "Capture stopped." }] }; }
+            await browserCommand("network_clear"); return { content: [{ type: "text", text: "Capture cleared." }] };
+        }
+    );
+
+    s.tool("network_requests", "List captured network requests.",
+        { filter: z.string().optional(), limit: z.number().optional() },
+        async ({ filter, limit }) => {
+            if (!isBridgeConnected()) return { content: [{ type: "text", text: "Browser extension not connected." }] };
+            const data = await browserCommand("network_list", { filter, limit: limit || 100 });
+            const entries = data?.requests || [];
+            const lines = entries.map((r: any) => `[${r.id}] ${r.method} ${r.status || "?"} ${r.url}`);
+            return { content: [{ type: "text", text: lines.length > 0 ? `${data.total} requests captured:\n${lines.join("\n")}` : "No requests captured." }] };
+        }
+    );
+
+    s.tool("network_request_detail", "Get full details for a captured request.",
+        { id: z.string().describe("Request ID from network_requests") },
+        async ({ id }) => {
+            if (!isBridgeConnected()) return { content: [{ type: "text", text: "Browser extension not connected." }] };
+            const detail = await browserCommand("network_get_request", { id });
+            return { content: [{ type: "text", text: json(detail) }] };
+        }
+    );
+
+    s.tool("bridge_status", "Check if the Neo Browser Bridge extension is connected.", {},
+        async () => ({ content: [{ type: "text", text: isBridgeConnected() ? "Connected." : "Not connected. Make sure Chrome is running with the Neo Bridge extension." }] })
+    );
+
+    // LinkedIn
+    s.tool("linkedin_profile", "Get a LinkedIn user's profile.", { vanity_name: z.string() },
+        async ({ vanity_name }) => ({ content: [{ type: "text", text: json(await linkedin.getProfile(getLinkedInAuth(), vanity_name)) }] }));
+    s.tool("linkedin_my_posts", "Get your own LinkedIn posts with engagement metrics.", { count: z.number().optional() },
+        async ({ count }) => ({ content: [{ type: "text", text: json(await linkedin.getMyPosts(getLinkedInAuth(), count || 20)) }] }));
+    s.tool("linkedin_feed", "Get your LinkedIn feed.", { count: z.number().optional() },
+        async ({ count }) => ({ content: [{ type: "text", text: json(await linkedin.getFeed(getLinkedInAuth(), count || 20)) }] }));
+    s.tool("linkedin_post", "Create a LinkedIn post.", { text: z.string() },
+        async ({ text }) => ({ content: [{ type: "text", text: json(await linkedin.createPost(getLinkedInAuth(), text)) }] }));
+    s.tool("linkedin_search", "Search for people on LinkedIn.", { query: z.string(), count: z.number().optional() },
+        async ({ query, count }) => ({ content: [{ type: "text", text: json(await linkedin.searchPeople(getLinkedInAuth(), query, count || 10)) }] }));
+    s.tool("linkedin_connections", "List your LinkedIn connections.", { count: z.number().optional() },
+        async ({ count }) => ({ content: [{ type: "text", text: json(await linkedin.getConnections(getLinkedInAuth(), count || 50)) }] }));
+
+    // Twitter
+    s.tool("twitter_profile", "Get a Twitter/X user's profile.", { screen_name: z.string() },
+        async ({ screen_name }) => ({ content: [{ type: "text", text: json(await twitter.getProfile(getTwitterAuth(), screen_name)) }] }));
+    s.tool("twitter_user_tweets", "Get a user's tweets with engagement metrics.", { screen_name: z.string(), count: z.number().optional() },
+        async ({ screen_name, count }) => ({ content: [{ type: "text", text: json(await twitter.getUserTweets(getTwitterAuth(), screen_name, count || 20)) }] }));
+    s.tool("twitter_timeline", "Get your home timeline.", { count: z.number().optional() },
+        async ({ count }) => ({ content: [{ type: "text", text: json(await twitter.getTimeline(getTwitterAuth(), count || 20)) }] }));
+    s.tool("twitter_post", "Post a tweet.", { text: z.string(), reply_to: z.string().optional() },
+        async ({ text, reply_to }) => ({ content: [{ type: "text", text: json(await twitter.createTweet(getTwitterAuth(), text, reply_to)) }] }));
+    s.tool("twitter_search", "Search tweets.", { query: z.string(), count: z.number().optional() },
+        async ({ query, count }) => ({ content: [{ type: "text", text: json(await twitter.searchTweets(getTwitterAuth(), query, count || 20)) }] }));
+
+    // Collections
+    s.tool("collection_create", "Create a new data collection.", {
+        name: z.string(), description: z.string(),
+        columns: z.array(z.object({ name: z.string(), type: z.enum(["text", "number", "boolean", "date", "json"]), description: z.string().optional() })),
+    }, async ({ name, description, columns }) => ({ content: [{ type: "text", text: json(db.createCollection(name, description, columns)) }] }));
+    s.tool("collection_insert", "Insert a row into a collection.", { collection: z.string(), data: z.record(z.string(), z.any()) },
+        async ({ collection, data }) => ({ content: [{ type: "text", text: json(db.collectionInsert(collection, data)) }] }));
+    s.tool("collection_query", "Query a collection.", {
+        collection: z.string(), search: z.string().optional(), where: z.record(z.string(), z.any()).optional(),
+        order_by: z.string().optional(), limit: z.number().optional(), offset: z.number().optional(),
+    }, async ({ collection, search, where, order_by, limit, offset }) => ({ content: [{ type: "text", text: json(db.collectionQuery(collection, { search, where, orderBy: order_by, limit, offset })) }] }));
+    s.tool("collection_list", "List all collections.", {}, async () => {
+        const collections = db.listCollections();
+        return { content: [{ type: "text", text: collections.length === 0 ? "No collections yet." : json(collections) }] };
+    });
+    s.tool("collection_update", "Update a row in a collection by ID.", { collection: z.string(), id: z.number(), data: z.record(z.string(), z.any()) },
+        async ({ collection, id, data }) => ({ content: [{ type: "text", text: db.collectionUpdate(collection, id, data) ? "Updated." : "Row not found." }] }));
+    s.tool("collection_delete", "Delete a row from a collection by ID.", { collection: z.string(), id: z.number() },
+        async ({ collection, id }) => ({ content: [{ type: "text", text: db.collectionDelete(collection, id) ? "Deleted." : "Row not found." }] }));
+
+    // Credentials
+    s.tool("list_credentials", "List all stored service credentials (keys only).", {},
+        async () => ({ content: [{ type: "text", text: json(db.listConnectedServices()) }] }));
+    s.tool("store_credential", "Manually store a credential for a service.", { service: z.string(), key: z.string(), value: z.string() },
+        async ({ service, key, value }) => { db.storeCredential(service, key, value); return { content: [{ type: "text", text: `Stored ${key} for ${service}.` }] }; });
+
+    // Dynamic tools
+    s.tool("create_tool", "Create a new MCP tool that persists across restarts.", {
+        name: z.string(), description: z.string(),
+        params_schema: z.record(z.string(), z.string()),
+        code: z.string(), service: z.string().optional(),
+    }, async ({ name, description, params_schema, code, service }) => {
+        db.saveCustomTool(name, description, params_schema, code, service);
+        registerDynamicTool(name, description, params_schema, code);
+        await server.server.sendToolListChanged();
+        return { content: [{ type: "text", text: `Tool "${name}" created and registered.` }] };
+    });
+    s.tool("list_custom_tools", "List all custom tools.", {}, async () => {
+        const tools = db.getCustomTools();
+        if (tools.length === 0) return { content: [{ type: "text", text: "No custom tools created yet." }] };
+        const lines = tools.map((t: any) => `${t.name} (${t.service || "general"}) — ${t.description}`);
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+    });
+    s.tool("get_tool_code", "View a custom tool's implementation.", { name: z.string() },
+        async ({ name }) => { const tool = db.getCustomTool(name); return { content: [{ type: "text", text: tool ? `// ${tool.name}: ${tool.description}\n// params: ${tool.params_schema}\n\n${tool.code}` : `Tool "${name}" not found.` }] }; });
+    s.tool("delete_tool", "Delete a custom tool.", { name: z.string() },
+        async ({ name }) => { const deleted = db.deleteCustomTool(name); if (deleted) await server.server.sendToolListChanged(); return { content: [{ type: "text", text: deleted ? `Deleted "${name}".` : `Tool "${name}" not found.` }] }; });
 }
 
 main().catch(console.error);

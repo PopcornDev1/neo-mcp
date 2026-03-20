@@ -275,7 +275,12 @@ async function handleCommand(method, params) {
 // ── Tab Group Management ─────────────────────────────────────────────────────
 // Neo works in its own tab group. Never touches user tabs.
 
+// Edge doesn't support chrome.tabGroups — detect once at startup
+const hasTabGroups = typeof chrome.tabGroups !== "undefined";
+
 async function ensureNeoGroup() {
+    if (!hasTabGroups) return null;
+
     // Check if our group still exists
     if (neoGroupId !== null) {
         try {
@@ -305,6 +310,7 @@ async function ensureNeoGroup() {
 }
 
 async function addTabToNeoGroup(tabId) {
+    if (!hasTabGroups) { neoTabIds.add(tabId); return; }
     const groupId = await ensureNeoGroup();
     try {
         await chrome.tabs.group({ tabIds: [tabId], groupId });
@@ -743,7 +749,15 @@ async function download(url, filename) {
 // Intercepts HTTP requests. Stores summaries in a lightweight list,
 // full headers/bodies stored separately so the agent can drill down lazily.
 
+// Edge MV3 has limited/broken webRequest — detect availability
+const hasWebRequest = typeof chrome.webRequest !== "undefined" &&
+    typeof chrome.webRequest.onBeforeSendHeaders !== "undefined";
+
 function networkStartCapture(filters, maxEntries) {
+    if (!hasWebRequest) {
+        return { capturing: false, error: "Network capture not available in this browser" };
+    }
+
     networkCapture.active = true;
     networkCapture.filters = filters || [];
     networkCapture.requests = [];
@@ -774,7 +788,7 @@ function networkStartCapture(filters, maxEntries) {
 
 function networkStopCapture() {
     networkCapture.active = false;
-    if (networkStartCapture._listening) {
+    if (hasWebRequest && networkStartCapture._listening) {
         chrome.webRequest.onBeforeSendHeaders.removeListener(networkOnRequest);
         chrome.webRequest.onCompleted.removeListener(networkOnResponse);
         chrome.webRequest.onBeforeRequest.removeListener(networkOnRequestBody);
@@ -1095,6 +1109,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: true });
     } else if (msg.type === "extract_auth") {
         extractAuth(msg.service).then(sendResponse);
+        return true; // async
+    } else if (msg.action === "relay_command") {
+        // Cowork relay: content script forwards commands from window.postMessage
+        handleCommand(msg.method, msg.params || {})
+            .then((result) => sendResponse(result))
+            .catch((err) => sendResponse({ error: err.message || String(err) }));
         return true; // async
     }
 });
