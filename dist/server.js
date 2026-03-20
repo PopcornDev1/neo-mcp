@@ -67,12 +67,26 @@ const server = new McpServer({ name: "neo", version: "1.0.0" }, { instructions: 
 function json(obj) {
     return JSON.stringify(obj, null, 2);
 }
+// In-memory credential cache for when db is unavailable (e.g. Linux VM / Cowork)
+const memCredentials = new Map();
 function getAuth(service) {
-    const creds = db.getCredentials(service);
-    if (!creds || Object.keys(creds).length === 0) {
-        throw new Error(`No credentials for "${service}". Use extract_auth to grab tokens from the browser first.`);
+    // Try database first, fall back to in-memory cache
+    try {
+        const creds = db.getCredentials(service);
+        if (creds && Object.keys(creds).length > 0)
+            return creds;
     }
-    return creds;
+    catch {
+        // db unavailable — use in-memory cache
+    }
+    const mem = memCredentials.get(service);
+    if (mem && Object.keys(mem).length > 0)
+        return mem;
+    throw new Error(`No credentials for "${service}". Use extract_auth to grab tokens from the browser first.`);
+}
+function storeAuthInMemory(service, creds) {
+    const existing = memCredentials.get(service) || {};
+    memCredentials.set(service, { ...existing, ...creds });
 }
 function getLinkedInAuth() {
     const creds = getAuth("linkedin");
@@ -92,12 +106,18 @@ server.tool("extract_auth", "Extract auth tokens from the user's logged-in brows
         return { content: [{ type: "text", text: "Browser extension not connected. Install the Neo Bridge extension and make sure Chrome is running." }] };
     }
     const result = await browserCommand("extract_auth", { service });
-    // Store extracted tokens
+    // Store extracted tokens in db + in-memory fallback
+    const creds = {};
     for (const [key, value] of Object.entries(result)) {
         if (key === "service" || key === "cookies" || !value || typeof value !== "string")
             continue;
-        db.storeCredential(service, key, value);
+        creds[key] = value;
+        try {
+            db.storeCredential(service, key, value);
+        }
+        catch { }
     }
+    storeAuthInMemory(service, creds);
     return { content: [{ type: "text", text: json(result) }] };
 });
 // ── Authenticated Fetch (ANY website) ────────────────────────────────────────
@@ -465,7 +485,7 @@ server.tool("delete_tool", "Delete a custom tool.", { name: z.string() }, async 
     return { content: [{ type: "text", text: deleted ? `Deleted "${name}".` : `Tool "${name}" not found.` }] };
 });
 // ── Start ────────────────────────────────────────────────────────────────────
-const useHttp = process.env.NEO_TRANSPORT === "http" || process.argv.includes("--http");
+const httpOnly = process.env.NEO_TRANSPORT === "http" || process.argv.includes("--http-only");
 const httpPort = parseInt(process.env.NEO_HTTP_PORT || "3100", 10);
 async function main() {
     // Start WebSocket server for browser extension
@@ -473,80 +493,78 @@ async function main() {
     // Wire browser command into integrations so they route through the extension
     linkedin.setBrowserCommand(browserCommand);
     twitter.setBrowserCommand(browserCommand);
-    // Load and register all saved custom tools
-    const customTools = db.getCustomTools();
-    for (const tool of customTools) {
-        try {
-            const schema = JSON.parse(tool.params_schema);
-            registerDynamicTool(tool.name, tool.description, schema, tool.code);
-        }
-        catch (err) {
-            console.error(`Failed to load custom tool "${tool.name}": ${err.message}`);
+    // Load and register all saved custom tools (graceful — db may fail on Linux VM)
+    try {
+        const customTools = db.getCustomTools();
+        for (const tool of customTools) {
+            try {
+                const schema = JSON.parse(tool.params_schema);
+                registerDynamicTool(tool.name, tool.description, schema, tool.code);
+            }
+            catch (err) {
+                console.error(`Failed to load custom tool "${tool.name}": ${err.message}`);
+            }
         }
     }
-    if (useHttp) {
-        // ── HTTP Streamable transport (for Cowork / remote clients) ──────────
-        const app = express();
-        // Track transports per session so we can route messages correctly
-        const transports = new Map();
-        app.post("/mcp", async (req, res) => {
-            // Check for existing session
-            const sessionId = req.headers["mcp-session-id"];
-            let transport;
-            if (sessionId && transports.has(sessionId)) {
-                // Reuse existing transport for this session
-                transport = transports.get(sessionId);
-            }
-            else if (!sessionId) {
-                // New session — create transport and connect a fresh server
-                transport = new StreamableHTTPServerTransport({
-                    sessionIdGenerator: () => randomUUID(),
-                });
-                transport.onclose = () => {
-                    if (transport.sessionId)
-                        transports.delete(transport.sessionId);
-                };
-                // Each HTTP session gets its own server instance with all the same tools
-                const sessionServer = new McpServer({ name: "neo", version: "1.0.0" }, { instructions: NEO_INSTRUCTIONS });
-                registerAllTools(sessionServer);
-                await sessionServer.connect(transport);
+    catch (err) {
+        console.error(`[neo-mcp] Database unavailable (${err.message.split("\n")[0]}). Collections and custom tools disabled.`);
+    }
+    // ── HTTP Streamable transport (always on — for Cowork/Windows/remote) ──
+    const app = express();
+    const transports = new Map();
+    app.post("/mcp", async (req, res) => {
+        const sessionId = req.headers["mcp-session-id"];
+        let transport;
+        if (sessionId && transports.has(sessionId)) {
+            transport = transports.get(sessionId);
+        }
+        else if (!sessionId) {
+            transport = new StreamableHTTPServerTransport({
+                sessionIdGenerator: () => randomUUID(),
+            });
+            transport.onclose = () => {
                 if (transport.sessionId)
-                    transports.set(transport.sessionId, transport);
-            }
-            else {
-                // Invalid session ID
-                res.status(400).json({ error: "Invalid or expired session" });
-                return;
-            }
-            await transport.handleRequest(req, res, req.body);
-        });
-        // SSE stream endpoint for server-to-client notifications
-        app.get("/mcp", async (req, res) => {
-            const sessionId = req.headers["mcp-session-id"];
-            if (!sessionId || !transports.has(sessionId)) {
-                res.status(400).json({ error: "Invalid or missing session ID" });
-                return;
-            }
-            await transports.get(sessionId).handleRequest(req, res);
-        });
-        // Session cleanup
-        app.delete("/mcp", async (req, res) => {
-            const sessionId = req.headers["mcp-session-id"];
-            if (sessionId && transports.has(sessionId)) {
-                await transports.get(sessionId).close();
-                transports.delete(sessionId);
-            }
-            res.status(200).end();
-        });
-        app.listen(httpPort, "0.0.0.0", () => {
-            console.error(`[neo-mcp] HTTP transport listening on http://0.0.0.0:${httpPort}/mcp`);
-            console.error(`[neo-mcp] Add to Cowork/Claude config as: { "url": "http://localhost:${httpPort}/mcp" }`);
-        });
-    }
-    else {
-        // ── Stdio transport (for Claude Desktop) ────────────────────────────
+                    transports.delete(transport.sessionId);
+            };
+            const sessionServer = new McpServer({ name: "neo", version: "1.0.0" }, { instructions: NEO_INSTRUCTIONS });
+            registerAllTools(sessionServer);
+            await sessionServer.connect(transport);
+            // Note: sessionId is generated during handleRequest, stored below
+        }
+        else {
+            res.status(400).json({ error: "Invalid or expired session" });
+            return;
+        }
+        await transport.handleRequest(req, res, req.body);
+        // Store new transports in the map AFTER handleRequest generates the session ID
+        if (transport.sessionId && !transports.has(transport.sessionId)) {
+            transports.set(transport.sessionId, transport);
+        }
+    });
+    app.get("/mcp", async (req, res) => {
+        const sessionId = req.headers["mcp-session-id"];
+        if (!sessionId || !transports.has(sessionId)) {
+            res.status(400).json({ error: "Invalid or missing session ID" });
+            return;
+        }
+        await transports.get(sessionId).handleRequest(req, res);
+    });
+    app.delete("/mcp", async (req, res) => {
+        const sessionId = req.headers["mcp-session-id"];
+        if (sessionId && transports.has(sessionId)) {
+            await transports.get(sessionId).close();
+            transports.delete(sessionId);
+        }
+        res.status(200).end();
+    });
+    app.listen(httpPort, "127.0.0.1", () => {
+        console.error(`[neo-mcp] HTTP transport listening on http://127.0.0.1:${httpPort}/mcp`);
+    });
+    // ── Stdio transport (for Claude Desktop — skip if HTTP-only mode) ────
+    if (!httpOnly) {
         const transport = new StdioServerTransport();
         await server.connect(transport);
+        console.error(`[neo-mcp] Stdio transport connected (Claude Desktop)`);
     }
 }
 /**
@@ -561,11 +579,17 @@ function registerAllTools(s) {
             return { content: [{ type: "text", text: "Browser extension not connected. Install the Neo Bridge extension and make sure Chrome is running." }] };
         }
         const result = await browserCommand("extract_auth", { service });
+        const creds = {};
         for (const [key, value] of Object.entries(result)) {
             if (key === "service" || key === "cookies" || !value || typeof value !== "string")
                 continue;
-            db.storeCredential(service, key, value);
+            creds[key] = value;
+            try {
+                db.storeCredential(service, key, value);
+            }
+            catch { }
         }
+        storeAuthInMemory(service, creds);
         return { content: [{ type: "text", text: json(result) }] };
     });
     // Authenticated fetch

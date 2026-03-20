@@ -10,12 +10,17 @@
   "files": [
     "dist",
     "extension",
+    "native-host.cjs",
+    "native-host.bat",
+    "scripts",
     "package.json"
   ],
   "scripts": {
     "build": "tsc",
     "prepare": "tsc",
+    "postinstall": "node scripts/postinstall.cjs",
     "start": "node dist/server.js",
+    "start:http": "node dist/server.js --http-only",
     "dev": "tsc && node dist/server.js"
   },
   "repository": {
