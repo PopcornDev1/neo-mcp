@@ -21,6 +21,7 @@ import * as twitter from "./integrations/twitter.js";
 import * as slack from "./integrations/slack.js";
 import * as gmail from "./integrations/gmail.js";
 import * as github from "./integrations/github.js";
+import * as gcal from "./integrations/gcal.js";
 import * as db from "./db.js";
 import { browserCommand, startBridge, isBridgeConnected } from "./bridge.js";
 
@@ -30,6 +31,7 @@ const NEO_INSTRUCTIONS = `Neo is a browser bridge that lets you operate the user
 - LinkedIn: extract_auth("linkedin") once, then use linkedin_* tools
 - Twitter/X: extract_auth("twitter") once, then use twitter_* tools
 - GitHub: extract_auth("github") once, then use github_* tools (repos, issues, PRs, actions, gists, search)
+- Google Calendar: gcal_connect (OAuth sign-in, then use gcal_* tools for events, scheduling, free/busy)
 - Slack: extract_auth("slack") once, then use slack_* tools
 - Gmail: gmail_connect (OAuth sign-in, supports multiple accounts via profile param)
 - WhatsApp: whatsapp_connect (QR code first time, auto-reconnects after)
@@ -124,6 +126,13 @@ async function getGmailAuth(profile?: string): Promise<gmail.GmailAuth> {
     const creds = getAuth(profileKey("gmail", profile));
     if (!creds.refresh_token) throw new Error(`Gmail not connected${profile ? ` for profile "${profile}"` : ""}. Use gmail_connect to authenticate.`);
     const access_token = await gmail.refreshAccessToken(creds.refresh_token, profile || "default");
+    return { access_token };
+}
+
+async function getGCalAuth(profile?: string): Promise<gcal.GCalAuth> {
+    const creds = getAuth(profileKey("gcal", profile));
+    if (!creds.refresh_token) throw new Error(`Google Calendar not connected${profile ? ` for profile "${profile}"` : ""}. Use gcal_connect to authenticate.`);
+    const access_token = await gcal.refreshAccessToken(creds.refresh_token, profile || "default");
     return { access_token };
 }
 
@@ -548,6 +557,81 @@ server.tool("github_rerun_workflow", "Re-run a failed workflow.", { owner: z.str
     async ({ owner, repo, run_id, profile }) => { await github.rerunWorkflow(getGitHubAuth(profile), owner, repo, run_id); return { content: [{ type: "text", text: "Re-run triggered." }] }; });
 server.tool("github_file", "Get file or directory contents from a repo.", { owner: z.string(), repo: z.string(), path: z.string(), ref: z.string().optional().describe("Branch, tag, or commit SHA"), ...profileParam },
     async ({ owner, repo, path, ref, profile }) => ({ content: [{ type: "text", text: json(await github.getFileContent(getGitHubAuth(profile), owner, repo, path, ref)) }] }));
+
+// ── Google Calendar ───────────────────────────────────────────────────────────
+
+server.tool("gcal_connect", "Connect a Google Calendar account via OAuth. Opens Google sign-in in the browser.",
+    { profile: z.string().optional().describe("Account name (e.g. 'personal', 'work'). Omit for default.") },
+    async ({ profile }) => {
+        const authUrl = `http://127.0.0.1:${httpPort}/gcal/auth${profile ? `?profile=${profile}` : ""}`;
+        try { await browserCommand("navigate", { url: authUrl }); } catch {}
+        const storageKey = profileKey("gcal", profile);
+        const deadline = Date.now() + 120000;
+        while (Date.now() < deadline) {
+            await new Promise(r => setTimeout(r, 2000));
+            const creds = memCredentials.get(storageKey);
+            if (creds?.refresh_token) {
+                const label = profile ? ` as "${profile}"` : "";
+                return { content: [{ type: "text", text: `Google Calendar connected${label}.` }] };
+            }
+        }
+        return { content: [{ type: "text", text: `Timed out. Visit ${authUrl} manually.` }] };
+    }
+);
+server.tool("gcal_calendars", "List your Google Calendar calendars.", { ...profileParam },
+    async ({ profile }) => ({ content: [{ type: "text", text: json(await gcal.listCalendars(await getGCalAuth(profile))) }] }));
+server.tool("gcal_events", "List upcoming calendar events.", {
+    calendar_id: z.string().optional().describe("Calendar ID (default: primary)"),
+    time_min: z.string().optional().describe("Start time ISO 8601 (default: now)"),
+    time_max: z.string().optional().describe("End time ISO 8601"),
+    max_results: z.number().optional(),
+    query: z.string().optional().describe("Free-text search"),
+    ...profileParam,
+}, async ({ calendar_id, time_min, time_max, max_results, query, profile }) => ({
+    content: [{ type: "text", text: json(await gcal.listEvents(await getGCalAuth(profile), calendar_id || "primary", { timeMin: time_min, timeMax: time_max, maxResults: max_results, query })) }],
+}));
+server.tool("gcal_event", "Get a specific calendar event.", { calendar_id: z.string().optional(), event_id: z.string(), ...profileParam },
+    async ({ calendar_id, event_id, profile }) => ({ content: [{ type: "text", text: json(await gcal.getEvent(await getGCalAuth(profile), calendar_id || "primary", event_id)) }] }));
+server.tool("gcal_create_event", "Create a calendar event.", {
+    summary: z.string(), description: z.string().optional(), location: z.string().optional(),
+    start: z.string().describe("Start time (ISO 8601 datetime or YYYY-MM-DD for all-day)"),
+    end: z.string().describe("End time (ISO 8601 datetime or YYYY-MM-DD for all-day)"),
+    attendees: z.array(z.string()).optional().describe("Email addresses of attendees"),
+    time_zone: z.string().optional(), calendar_id: z.string().optional(),
+    recurrence: z.array(z.string()).optional().describe("RRULE strings, e.g. ['RRULE:FREQ=WEEKLY;COUNT=10']"),
+    add_meet: z.boolean().optional().describe("Add a Google Meet link"),
+    ...profileParam,
+}, async ({ summary, description, location, start, end, attendees, time_zone, calendar_id, recurrence, add_meet, profile }) => ({
+    content: [{ type: "text", text: json(await gcal.createEvent(await getGCalAuth(profile), calendar_id || "primary", { summary, description, location, start, end, attendees, timeZone: time_zone, recurrence, conferenceData: add_meet })) }],
+}));
+server.tool("gcal_update_event", "Update a calendar event.", {
+    event_id: z.string(), calendar_id: z.string().optional(),
+    summary: z.string().optional(), description: z.string().optional(), location: z.string().optional(),
+    start: z.string().optional(), end: z.string().optional(), time_zone: z.string().optional(),
+    ...profileParam,
+}, async ({ event_id, calendar_id, summary, description, location, start, end, time_zone, profile }) => ({
+    content: [{ type: "text", text: json(await gcal.updateEvent(await getGCalAuth(profile), calendar_id || "primary", event_id, { summary, description, location, start, end, timeZone: time_zone })) }],
+}));
+server.tool("gcal_delete_event", "Delete a calendar event.", { event_id: z.string(), calendar_id: z.string().optional(), ...profileParam },
+    async ({ event_id, calendar_id, profile }) => { await gcal.deleteEvent(await getGCalAuth(profile), calendar_id || "primary", event_id); return { content: [{ type: "text", text: "Event deleted." }] }; });
+server.tool("gcal_respond", "Respond to a calendar invite (accept/decline/tentative).", {
+    event_id: z.string(), response: z.enum(["accepted", "declined", "tentative"]), calendar_id: z.string().optional(), ...profileParam,
+}, async ({ event_id, response, calendar_id, profile }) => ({
+    content: [{ type: "text", text: json(await gcal.respondToEvent(await getGCalAuth(profile), calendar_id || "primary", event_id, response)) }],
+}));
+server.tool("gcal_quick_add", "Create an event from natural language text (e.g. 'Lunch with John tomorrow at noon').", {
+    text: z.string(), calendar_id: z.string().optional(), ...profileParam,
+}, async ({ text, calendar_id, profile }) => ({
+    content: [{ type: "text", text: json(await gcal.quickAddEvent(await getGCalAuth(profile), calendar_id || "primary", text)) }],
+}));
+server.tool("gcal_freebusy", "Check free/busy status for calendars.", {
+    calendar_ids: z.array(z.string()).optional().describe("Calendar IDs (default: [primary])"),
+    time_min: z.string().describe("Start time ISO 8601"),
+    time_max: z.string().describe("End time ISO 8601"),
+    ...profileParam,
+}, async ({ calendar_ids, time_min, time_max, profile }) => ({
+    content: [{ type: "text", text: json(await gcal.freeBusy(await getGCalAuth(profile), calendar_ids || ["primary"], time_min, time_max)) }],
+}));
 
 // ── Collections (agent-designed data storage) ────────────────────────────────
 
@@ -1411,6 +1495,32 @@ async function main() {
         }
     });
 
+    // ── Google Calendar OAuth ───────────────────────────────────────────────
+    app.get("/gcal/auth", (req: any, res: any) => {
+        const profile = req.query.profile || undefined;
+        const redirectUri = `http://localhost:${httpPort}/gcal/callback`;
+        const url = gcal.getOAuthUrl(redirectUri, profile);
+        res.redirect(url);
+    });
+
+    app.get("/gcal/callback", async (req: any, res: any) => {
+        const code = req.query.code as string;
+        const profile = (req.query.state as string) || "default";
+        if (!code) { res.status(400).send("Missing authorization code."); return; }
+        try {
+            const redirectUri = `http://localhost:${httpPort}/gcal/callback`;
+            const tokens = await gcal.exchangeCode(code, redirectUri);
+            const storageKey = profileKey("gcal", profile === "default" ? undefined : profile);
+            const creds: Record<string, string> = { refresh_token: tokens.refresh_token };
+            try { db.storeCredential(storageKey, "refresh_token", tokens.refresh_token); } catch {}
+            storeAuthInMemory(storageKey, creds);
+            const label = profile !== "default" ? ` (profile: ${profile})` : "";
+            res.send(`<html><body style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:system-ui;background:#111;color:#fff"><div style="text-align:center"><h1>Google Calendar Connected &#x2705;</h1><p style="color:#aaa">${label}</p><p style="color:#666">You can close this tab.</p></div></body></html>`);
+        } catch (err: any) {
+            res.status(500).send(`<html><body style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:system-ui;background:#111;color:#fff"><div style="text-align:center"><h1>Auth Failed</h1><p style="color:#f66">${err.message}</p></div></body></html>`);
+        }
+    });
+
     // ── WhatsApp QR page ──────────────────────────────────────────────────
     app.get("/whatsapp-qr", async (req, res) => {
         const wa = await import("./integrations/whatsapp.js");
@@ -1635,6 +1745,39 @@ function registerAllTools(s: McpServer) {
         async ({ owner, repo, run_id, profile }) => { await github.rerunWorkflow(getGitHubAuth(profile), owner, repo, run_id); return { content: [{ type: "text", text: "Re-run triggered." }] }; });
     s.tool("github_file", "Get file or directory contents from a repo.", { owner: z.string(), repo: z.string(), path: z.string(), ref: z.string().optional().describe("Branch, tag, or commit SHA"), ...profileParam },
         async ({ owner, repo, path, ref, profile }) => ({ content: [{ type: "text", text: json(await github.getFileContent(getGitHubAuth(profile), owner, repo, path, ref)) }] }));
+
+    // Google Calendar
+    s.tool("gcal_connect", "Connect a Google Calendar account via OAuth.", { profile: z.string().optional() },
+        async ({ profile }) => {
+            const authUrl = `http://127.0.0.1:${httpPort}/gcal/auth${profile ? `?profile=${profile}` : ""}`;
+            try { await browserCommand("navigate", { url: authUrl }); } catch {}
+            const storageKey = profileKey("gcal", profile);
+            const deadline = Date.now() + 120000;
+            while (Date.now() < deadline) {
+                await new Promise(r => setTimeout(r, 2000));
+                const creds = memCredentials.get(storageKey);
+                if (creds?.refresh_token) { return { content: [{ type: "text", text: `Google Calendar connected${profile ? ` as "${profile}"` : ""}.` }] }; }
+            }
+            return { content: [{ type: "text", text: `Timed out. Visit ${authUrl} manually.` }] };
+        });
+    s.tool("gcal_calendars", "List your Google Calendar calendars.", { ...profileParam },
+        async ({ profile }) => ({ content: [{ type: "text", text: json(await gcal.listCalendars(await getGCalAuth(profile))) }] }));
+    s.tool("gcal_events", "List upcoming calendar events.", { calendar_id: z.string().optional(), time_min: z.string().optional(), time_max: z.string().optional(), max_results: z.number().optional(), query: z.string().optional(), ...profileParam },
+        async ({ calendar_id, time_min, time_max, max_results, query, profile }) => ({ content: [{ type: "text", text: json(await gcal.listEvents(await getGCalAuth(profile), calendar_id || "primary", { timeMin: time_min, timeMax: time_max, maxResults: max_results, query })) }] }));
+    s.tool("gcal_event", "Get a specific calendar event.", { calendar_id: z.string().optional(), event_id: z.string(), ...profileParam },
+        async ({ calendar_id, event_id, profile }) => ({ content: [{ type: "text", text: json(await gcal.getEvent(await getGCalAuth(profile), calendar_id || "primary", event_id)) }] }));
+    s.tool("gcal_create_event", "Create a calendar event.", { summary: z.string(), description: z.string().optional(), location: z.string().optional(), start: z.string(), end: z.string(), attendees: z.array(z.string()).optional(), time_zone: z.string().optional(), calendar_id: z.string().optional(), recurrence: z.array(z.string()).optional(), add_meet: z.boolean().optional(), ...profileParam },
+        async ({ summary, description, location, start, end, attendees, time_zone, calendar_id, recurrence, add_meet, profile }) => ({ content: [{ type: "text", text: json(await gcal.createEvent(await getGCalAuth(profile), calendar_id || "primary", { summary, description, location, start, end, attendees, timeZone: time_zone, recurrence, conferenceData: add_meet })) }] }));
+    s.tool("gcal_update_event", "Update a calendar event.", { event_id: z.string(), calendar_id: z.string().optional(), summary: z.string().optional(), description: z.string().optional(), location: z.string().optional(), start: z.string().optional(), end: z.string().optional(), time_zone: z.string().optional(), ...profileParam },
+        async ({ event_id, calendar_id, summary, description, location, start, end, time_zone, profile }) => ({ content: [{ type: "text", text: json(await gcal.updateEvent(await getGCalAuth(profile), calendar_id || "primary", event_id, { summary, description, location, start, end, timeZone: time_zone })) }] }));
+    s.tool("gcal_delete_event", "Delete a calendar event.", { event_id: z.string(), calendar_id: z.string().optional(), ...profileParam },
+        async ({ event_id, calendar_id, profile }) => { await gcal.deleteEvent(await getGCalAuth(profile), calendar_id || "primary", event_id); return { content: [{ type: "text", text: "Event deleted." }] }; });
+    s.tool("gcal_respond", "Respond to a calendar invite.", { event_id: z.string(), response: z.enum(["accepted", "declined", "tentative"]), calendar_id: z.string().optional(), ...profileParam },
+        async ({ event_id, response, calendar_id, profile }) => ({ content: [{ type: "text", text: json(await gcal.respondToEvent(await getGCalAuth(profile), calendar_id || "primary", event_id, response)) }] }));
+    s.tool("gcal_quick_add", "Create an event from natural language text.", { text: z.string(), calendar_id: z.string().optional(), ...profileParam },
+        async ({ text, calendar_id, profile }) => ({ content: [{ type: "text", text: json(await gcal.quickAddEvent(await getGCalAuth(profile), calendar_id || "primary", text)) }] }));
+    s.tool("gcal_freebusy", "Check free/busy status for calendars.", { calendar_ids: z.array(z.string()).optional(), time_min: z.string(), time_max: z.string(), ...profileParam },
+        async ({ calendar_ids, time_min, time_max, profile }) => ({ content: [{ type: "text", text: json(await gcal.freeBusy(await getGCalAuth(profile), calendar_ids || ["primary"], time_min, time_max)) }] }));
 
     // Slack
     s.tool("slack_channels", "List Slack channels.", { ...profileParam },
