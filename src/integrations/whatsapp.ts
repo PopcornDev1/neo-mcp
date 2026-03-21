@@ -403,40 +403,92 @@ export async function getChats(limit = 20): Promise<Array<{
     });
 }
 
-export async function readMessages(chatId: string, limit = 50): Promise<Message[]> {
-    const s = ensureConnected();
+export async function readMessages(chatId: string, opts: { limit?: number; offset?: number; query?: string; before?: number } = {}): Promise<Message[]> {
+    ensureConnected();
     await waitForSync();
     const jid = normalizeJid(chatId);
+    const { limit = 50, offset = 0, query, before } = opts;
 
     // Check both phone JID and LID for messages
     let msgs = messageStore.get(jid) || [];
     if (msgs.length === 0) {
-        // Try the alternate ID (phone↔LID)
         const altJid = jidToLid.get(jid) || lidToJid.get(jid);
         if (altJid) msgs = messageStore.get(altJid) || [];
     }
 
-    return msgs
-        .slice(-limit)
-        .filter((m) => m.message)
-        .map((m) => {
-            const body =
-                m.message?.conversation ||
-                m.message?.extendedTextMessage?.text ||
-                m.message?.imageMessage?.caption ||
-                m.message?.videoMessage?.caption ||
-                m.message?.documentMessage?.fileName ||
-                "[media]";
+    let filtered = msgs.filter((m) => m.message);
 
-            return {
-                id: m.key.id || "",
-                source: "whatsapp" as const,
-                channel: jid,
-                channelName: chatId,
-                from: m.key.fromMe ? "me" : (m.pushName || resolveName(m.key.participant || jid)),
-                body,
-                timestamp: new Date((m.messageTimestamp as number) * 1000),
-            };
+    // Filter by timestamp (before cursor for pagination)
+    if (before) {
+        filtered = filtered.filter((m) => (m.messageTimestamp as number) < before);
+    }
+
+    // Filter by text search
+    if (query) {
+        const q = query.toLowerCase();
+        filtered = filtered.filter((m) => {
+            const body = extractBody(m);
+            return body.toLowerCase().includes(q);
+        });
+    }
+
+    return filtered
+        .slice(-(offset + limit), offset ? -offset : undefined)
+        .map((m) => formatMessage(m, jid, chatId));
+}
+
+/** Search messages across all chats */
+export async function searchMessages(query: string, opts: { limit?: number; chatId?: string } = {}): Promise<Array<Message & { chatName: string }>> {
+    ensureConnected();
+    await waitForSync();
+    const { limit = 30, chatId } = opts;
+    const q = query.toLowerCase();
+    const results: Array<Message & { chatName: string }> = [];
+
+    const jids = chatId ? [normalizeJid(chatId)] : Array.from(messageStore.keys());
+
+    for (const jid of jids) {
+        const msgs = messageStore.get(jid) || [];
+        for (const m of msgs) {
+            if (!m.message) continue;
+            const body = extractBody(m);
+            if (body.toLowerCase().includes(q)) {
+                results.push({
+                    ...formatMessage(m, jid, jid),
+                    chatName: resolveName(jid),
+                });
+            }
+            if (results.length >= limit) break;
+        }
+        if (results.length >= limit) break;
+    }
+
+    return results;
+}
+
+/** Search/filter chat list by name */
+export async function searchChats(query: string, limit = 20): Promise<Array<{
+    id: string; name: string; lastMessage: string; lastTimestamp: number; unreadCount: number; isGroup: boolean;
+}>> {
+    ensureConnected();
+    await waitForSync();
+    const q = query.toLowerCase();
+
+    return Array.from(chats.values())
+        .filter((c) => {
+            if (!c.id) return false;
+            const name = (c as any)?.name || resolveName(c.id);
+            return name.toLowerCase().includes(q);
+        })
+        .sort((a, b) => ((b as any).conversationTimestamp || 0) - ((a as any).conversationTimestamp || 0))
+        .slice(0, limit)
+        .map((chat) => {
+            const id = chat.id!;
+            const name = (chat as any)?.name || resolveName(id);
+            const msgs = messageStore.get(id);
+            const lastMsg = msgs?.[msgs.length - 1];
+            const lastText = lastMsg?.message?.conversation || lastMsg?.message?.extendedTextMessage?.text || "";
+            return { id, name, lastMessage: lastText.slice(0, 100), lastTimestamp: (chat as any).conversationTimestamp || 0, unreadCount: (chat as any).unreadCount || 0, isGroup: id.endsWith("@g.us") };
         });
 }
 
@@ -445,7 +497,6 @@ export async function readMessages(chatId: string, limit = 50): Promise<Message[
 export async function sendMessage(chatId: string, text: string): Promise<{ id: string }> {
     const s = ensureConnected();
     let jid = normalizeJid(chatId);
-    // Prefer LID for sending if available (WhatsApp multi-device)
     const lid = jidToLid.get(jid);
     if (lid) jid = lid;
     const result = await s.sendMessage(jid, { text });
@@ -461,102 +512,292 @@ export async function replyToMessage(chatId: string, text: string, quotedMessage
     return { id: result?.key?.id || "" };
 }
 
+export async function sendMedia(chatId: string, opts: {
+    type: "image" | "video" | "document" | "audio" | "sticker";
+    url: string;
+    caption?: string;
+    filename?: string;
+    mimetype?: string;
+}): Promise<{ id: string }> {
+    const s = ensureConnected();
+    let jid = normalizeJid(chatId);
+    const lid = jidToLid.get(jid);
+    if (lid) jid = lid;
+
+    let content: any;
+    switch (opts.type) {
+        case "image": content = { image: { url: opts.url }, caption: opts.caption }; break;
+        case "video": content = { video: { url: opts.url }, caption: opts.caption }; break;
+        case "document": content = { document: { url: opts.url }, fileName: opts.filename || "file", mimetype: opts.mimetype || "application/octet-stream", caption: opts.caption }; break;
+        case "audio": content = { audio: { url: opts.url }, mimetype: opts.mimetype || "audio/mpeg", ptt: false }; break;
+        case "sticker": content = { sticker: { url: opts.url } }; break;
+    }
+    const result = await s.sendMessage(jid, content);
+    return { id: result?.key?.id || "" };
+}
+
+export async function sendLocation(chatId: string, lat: number, lng: number, name?: string): Promise<{ id: string }> {
+    const s = ensureConnected();
+    let jid = normalizeJid(chatId);
+    const lid = jidToLid.get(jid);
+    if (lid) jid = lid;
+    const result = await s.sendMessage(jid, { location: { degreesLatitude: lat, degreesLongitude: lng, name: name || "" } });
+    return { id: result?.key?.id || "" };
+}
+
+export async function sendContact(chatId: string, contactName: string, contactPhone: string): Promise<{ id: string }> {
+    const s = ensureConnected();
+    let jid = normalizeJid(chatId);
+    const lid = jidToLid.get(jid);
+    if (lid) jid = lid;
+    const vcard = `BEGIN:VCARD\nVERSION:3.0\nFN:${contactName}\nTEL;type=CELL;type=VOICE;waid=${contactPhone}:+${contactPhone}\nEND:VCARD`;
+    const result = await s.sendMessage(jid, { contacts: { displayName: contactName, contacts: [{ vcard }] } });
+    return { id: result?.key?.id || "" };
+}
+
 export async function markRead(chatId: string): Promise<void> {
     const s = ensureConnected();
     const jid = normalizeJid(chatId);
     await s.readMessages([{ remoteJid: jid, id: undefined as any }]);
 }
 
-// ── Contacts ─────────────────────────────────────────────────────────────────
+// ── Contacts & Profile ───────────────────────────────────────────────────────
 
-export async function findContact(query: string): Promise<Array<{
-    id: string;
-    name: string;
-    phone: string;
-}>> {
+export async function findContact(query: string): Promise<Array<{ id: string; name: string; phone: string }>> {
     const s = ensureConnected();
     await waitForSync();
     const queryLower = query.toLowerCase();
 
-    // Search by phone number
     if (/^\+?\d+$/.test(query.replace(/[\s-]/g, ""))) {
         const phone = query.replace(/[\s\-+]/g, "");
         const jid = `${phone}@s.whatsapp.net`;
         const results = await s.onWhatsApp(jid);
-        const result = results?.[0];
-        if (result?.exists) {
-            return [{ id: jid, name: resolveName(jid), phone }];
-        }
+        if (results?.[0]?.exists) return [{ id: jid, name: resolveName(jid), phone }];
         return [];
     }
 
-    // Search by name in contacts
     const found: Array<{ id: string; name: string; phone: string }> = [];
-    // Search contacts AND nameCache
     const searched = new Set<string>();
     for (const [jid, contact] of contacts) {
         const name = (contact as any)?.name || (contact as any)?.notify || resolveName(jid);
-        if (name.toLowerCase().includes(queryLower)) {
-            found.push({ id: jid, name, phone: jid.split("@")[0] });
-            searched.add(jid);
-        }
+        if (name.toLowerCase().includes(queryLower)) { found.push({ id: jid, name, phone: jid.split("@")[0] }); searched.add(jid); }
     }
-    // Also search name cache (catches pushNames from group messages)
     for (const [jid, name] of nameCache) {
         if (searched.has(jid)) continue;
-        if (name.toLowerCase().includes(queryLower)) {
-            found.push({ id: jid, name, phone: jid.split("@")[0] });
-        }
+        if (name.toLowerCase().includes(queryLower)) found.push({ id: jid, name, phone: jid.split("@")[0] });
     }
-
     return found;
+}
+
+export async function checkOnWhatsApp(phone: string): Promise<{ exists: boolean; jid?: string }> {
+    const s = ensureConnected();
+    const cleaned = phone.replace(/[\s\-+]/g, "");
+    const jid = `${cleaned}@s.whatsapp.net`;
+    const results = await s.onWhatsApp(jid);
+    const r = results?.[0];
+    return { exists: !!r?.exists, jid: r?.jid };
+}
+
+export async function getProfilePicUrl(chatId: string): Promise<string | null> {
+    const s = ensureConnected();
+    const jid = normalizeJid(chatId);
+    try { return await s.profilePictureUrl(jid, "image") || null; } catch { return null; }
+}
+
+export async function getStatus(chatId: string): Promise<any> {
+    const s = ensureConnected();
+    const jid = normalizeJid(chatId);
+    const result = await s.fetchStatus(jid);
+    return result;
+}
+
+export async function updateMyStatus(status: string): Promise<void> {
+    const s = ensureConnected();
+    await s.updateProfileStatus(status);
+}
+
+export async function sendPresence(type: "available" | "unavailable" | "composing" | "paused" | "recording", chatId?: string): Promise<void> {
+    const s = ensureConnected();
+    const jid = chatId ? normalizeJid(chatId) : undefined;
+    await s.sendPresenceUpdate(type, jid);
+}
+
+export async function addOrEditContact(phone: string, name: string): Promise<void> {
+    const s = ensureConnected();
+    const jid = normalizeJid(phone);
+    await s.addOrEditContact(jid, { fullName: name } as any);
+}
+
+// ── Chat Management ──────────────────────────────────────────────────────────
+
+export async function modifyChat(chatId: string, action: "archive" | "unarchive" | "mute" | "unmute" | "pin" | "unpin"): Promise<void> {
+    const s = ensureConnected();
+    const jid = normalizeJid(chatId);
+    let mod: any;
+    switch (action) {
+        case "archive": mod = { archive: true, lastMessages: [] }; break;
+        case "unarchive": mod = { archive: false, lastMessages: [] }; break;
+        case "mute": mod = { mute: Date.now() + 8 * 60 * 60 * 1000 }; break;
+        case "unmute": mod = { mute: null }; break;
+        case "pin": mod = { pin: true }; break;
+        case "unpin": mod = { pin: false }; break;
+    }
+    await s.chatModify(mod, jid);
+}
+
+export async function starMessages(chatId: string, messageIds: string[], star: boolean): Promise<void> {
+    const s = ensureConnected();
+    const jid = normalizeJid(chatId);
+    await s.star(jid, messageIds.map((id) => ({ id })), star);
+}
+
+// ── Privacy ──────────────────────────────────────────────────────────────────
+
+export async function blockContact(chatId: string): Promise<void> {
+    const s = ensureConnected();
+    await s.updateBlockStatus(normalizeJid(chatId), "block");
+}
+
+export async function unblockContact(chatId: string): Promise<void> {
+    const s = ensureConnected();
+    await s.updateBlockStatus(normalizeJid(chatId), "unblock");
+}
+
+export async function getBlocklist(): Promise<string[]> {
+    const s = ensureConnected();
+    const list = await s.fetchBlocklist();
+    return list.filter((x): x is string => !!x);
+}
+
+// ── Groups ───────────────────────────────────────────────────────────────────
+
+export async function getGroupMetadata(groupId: string): Promise<any> {
+    const s = ensureConnected();
+    return await s.groupMetadata(normalizeJid(groupId));
+}
+
+export async function createGroup(subject: string, participants: string[]): Promise<any> {
+    const s = ensureConnected();
+    const jids = participants.map((p) => normalizeJid(p));
+    return await s.groupCreate(subject, jids);
+}
+
+export async function updateGroupParticipants(groupId: string, participants: string[], action: "add" | "remove" | "promote" | "demote"): Promise<any> {
+    const s = ensureConnected();
+    const jids = participants.map((p) => normalizeJid(p));
+    return await s.groupParticipantsUpdate(normalizeJid(groupId), jids, action);
+}
+
+export async function updateGroupSubject(groupId: string, subject: string): Promise<void> {
+    const s = ensureConnected();
+    await s.groupUpdateSubject(normalizeJid(groupId), subject);
+}
+
+export async function updateGroupDescription(groupId: string, description: string): Promise<void> {
+    const s = ensureConnected();
+    await s.groupUpdateDescription(normalizeJid(groupId), description);
+}
+
+export async function getAllGroups(): Promise<any> {
+    const s = ensureConnected();
+    return await s.groupFetchAllParticipating();
+}
+
+export async function getGroupInviteCode(groupId: string): Promise<string> {
+    const s = ensureConnected();
+    return (await s.groupInviteCode(normalizeJid(groupId))) || "";
+}
+
+export async function leaveGroup(groupId: string): Promise<void> {
+    const s = ensureConnected();
+    await s.groupLeave(normalizeJid(groupId));
+}
+
+// ── Newsletters / Channels ───────────────────────────────────────────────────
+
+export async function createNewsletter(name: string, description?: string): Promise<any> {
+    const s = ensureConnected();
+    return await s.newsletterCreate(name, description);
+}
+
+export async function followNewsletter(jid: string): Promise<void> {
+    const s = ensureConnected();
+    await s.newsletterFollow(jid);
+}
+
+export async function unfollowNewsletter(jid: string): Promise<void> {
+    const s = ensureConnected();
+    await s.newsletterUnfollow(jid);
+}
+
+export async function getNewsletterMessages(jid: string, count = 20): Promise<any> {
+    const s = ensureConnected();
+    return await s.newsletterFetchMessages(jid, count, undefined as any, undefined as any);
+}
+
+export async function getNewsletterMetadata(jid: string): Promise<any> {
+    const s = ensureConnected();
+    return await s.newsletterMetadata("jid", jid);
+}
+
+// ── Business ─────────────────────────────────────────────────────────────────
+
+export async function getBusinessProfile(chatId: string): Promise<any> {
+    const s = ensureConnected();
+    return await s.getBusinessProfile(normalizeJid(chatId));
+}
+
+export async function getCatalog(chatId: string, limit = 50): Promise<any> {
+    const s = ensureConnected();
+    return await s.getCatalog({ jid: normalizeJid(chatId), limit });
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+/** Extract text body from a WAMessage */
+function extractBody(m: WAMessage): string {
+    return m.message?.conversation ||
+        m.message?.extendedTextMessage?.text ||
+        m.message?.imageMessage?.caption ||
+        m.message?.videoMessage?.caption ||
+        m.message?.documentMessage?.fileName ||
+        "[media]";
+}
+
+/** Format a WAMessage to our Message type */
+function formatMessage(m: WAMessage, jid: string, chatId: string): Message & { id: string } {
+    return {
+        id: m.key.id || "",
+        source: "whatsapp" as const,
+        channel: jid,
+        channelName: chatId,
+        from: m.key.fromMe ? "me" : (m.pushName || resolveName(m.key.participant || jid)),
+        body: extractBody(m),
+        timestamp: new Date((m.messageTimestamp as number) * 1000),
+    };
+}
+
 /** Debug: dump raw store state */
-export function debugStore(): {
-    chatCount: number;
-    contactCount: number;
-    messageChats: string[];
-    messageCounts: Record<string, number>;
-    nameCount: number;
-    sampleNames: Array<[string, string]>;
-} {
+export function debugStore() {
     const messageCounts: Record<string, number> = {};
     for (const [jid, msgs] of messageStore) {
         messageCounts[resolveName(jid) + " (" + jid + ")"] = msgs.length;
     }
     return {
-        chatCount: chats.size,
-        contactCount: contacts.size,
-        messageChats: Array.from(messageStore.keys()),
-        messageCounts,
-        nameCount: nameCache.size,
-        sampleNames: Array.from(nameCache.entries()).slice(0, 20),
+        chatCount: chats.size, contactCount: contacts.size,
+        messageChats: Array.from(messageStore.keys()), messageCounts,
+        nameCount: nameCache.size, sampleNames: Array.from(nameCache.entries()).slice(0, 20),
     };
 }
 
 /** Resolve a JID/LID to a human-readable name */
 function resolveName(jid: string): string {
-    // 1. Check our name cache (built from pushNames + contacts)
     const cached = nameCache.get(jid);
     if (cached) return cached;
-
-    // 2. Check contacts
     const contact = contacts.get(jid);
-    if (contact) {
-        const name = (contact as any).name || (contact as any).notify;
-        if (name) return name;
-    }
-
-    // 3. Strip the @suffix for phone numbers
+    if (contact) { const name = (contact as any).name || (contact as any).notify; if (name) return name; }
     const bare = jid.split("@")[0];
-    // If it's a phone number, format it
-    if (/^\d+$/.test(bare) && bare.length >= 10) {
-        return "+" + bare;
-    }
-
+    if (/^\d+$/.test(bare) && bare.length >= 10) return "+" + bare;
     return bare;
 }
 

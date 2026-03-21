@@ -478,44 +478,125 @@ server.tool(
     }
 );
 
-server.tool(
-    "whatsapp_chats",
-    "List WhatsApp chats with last message and unread count.",
-    { limit: z.number().optional() },
-    async ({ limit }) => {
-        const wa = await import("./integrations/whatsapp.js");
-        const chats = await wa.getChats(limit || 30);
-        return { content: [{ type: "text", text: json(chats) }] };
-    }
-);
+server.tool("whatsapp_chats", "List WhatsApp chats with last message and unread count.", { limit: z.number().optional() },
+    async ({ limit }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.getChats(limit || 30)) }] }; });
 
-server.tool(
-    "whatsapp_read",
-    "Read messages from a WhatsApp chat. Pass chat ID, phone number, or contact name.",
-    {
-        chat: z.string().describe("Chat ID, phone number (e.g. +919876543210), or contact name"),
-        limit: z.number().optional(),
-    },
-    async ({ chat, limit }) => {
-        const wa = await import("./integrations/whatsapp.js");
-        const messages = await wa.readMessages(chat, limit || 30);
-        return { content: [{ type: "text", text: json(messages) }] };
-    }
-);
+server.tool("whatsapp_search_chats", "Search WhatsApp chats by name.", { query: z.string(), limit: z.number().optional() },
+    async ({ query, limit }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.searchChats(query, limit || 20)) }] }; });
 
-server.tool(
-    "whatsapp_send",
-    "Send a WhatsApp message.",
-    {
-        to: z.string().describe("Phone number, contact name, or chat ID"),
-        text: z.string(),
-    },
-    async ({ to, text }) => {
-        const wa = await import("./integrations/whatsapp.js");
-        const result = await wa.sendMessage(to, text);
-        return { content: [{ type: "text", text: json(result) }] };
-    }
-);
+server.tool("whatsapp_read", "Read messages from a WhatsApp chat with pagination and search.",
+    { chat: z.string().describe("Chat ID, phone number, or contact name"), limit: z.number().optional(), offset: z.number().optional().describe("Skip N most recent messages"), query: z.string().optional().describe("Filter messages containing this text"), before: z.number().optional().describe("Unix timestamp cursor — only messages before this time") },
+    async ({ chat, limit, offset, query, before }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.readMessages(chat, { limit: limit || 30, offset, query, before })) }] }; });
+
+server.tool("whatsapp_search", "Search messages across all WhatsApp chats by text content.",
+    { query: z.string(), chat: z.string().optional().describe("Limit search to a specific chat"), limit: z.number().optional() },
+    async ({ query, chat, limit }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.searchMessages(query, { chatId: chat, limit: limit || 30 })) }] }; });
+
+server.tool("whatsapp_send", "Send a WhatsApp text message.", { to: z.string().describe("Phone number, contact name, or chat ID"), text: z.string() },
+    async ({ to, text }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.sendMessage(to, text)) }] }; });
+
+server.tool("whatsapp_send_media", "Send media (image, video, document, audio, sticker) on WhatsApp.",
+    { to: z.string(), type: z.enum(["image", "video", "document", "audio", "sticker"]), url: z.string().describe("File URL or local path"), caption: z.string().optional(), filename: z.string().optional(), mimetype: z.string().optional() },
+    async ({ to, type, url, caption, filename, mimetype }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.sendMedia(to, { type, url, caption, filename, mimetype })) }] }; });
+
+server.tool("whatsapp_send_location", "Send a location on WhatsApp.", { to: z.string(), latitude: z.number(), longitude: z.number(), name: z.string().optional() },
+    async ({ to, latitude, longitude, name }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.sendLocation(to, latitude, longitude, name)) }] }; });
+
+server.tool("whatsapp_send_contact", "Send a contact card on WhatsApp.", { to: z.string(), contact_name: z.string(), contact_phone: z.string().describe("Phone number without + prefix") },
+    async ({ to, contact_name, contact_phone }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.sendContact(to, contact_name, contact_phone)) }] }; });
+
+// WhatsApp Contacts & Profile
+server.tool("whatsapp_check_number", "Check if a phone number is on WhatsApp.", { phone: z.string() },
+    async ({ phone }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.checkOnWhatsApp(phone)) }] }; });
+
+server.tool("whatsapp_find_contact", "Search contacts by name or phone number.", { query: z.string() },
+    async ({ query }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.findContact(query)) }] }; });
+
+server.tool("whatsapp_profile_pic", "Get profile picture URL for a contact or group.", { chat: z.string() },
+    async ({ chat }) => { const wa = await import("./integrations/whatsapp.js"); const url = await wa.getProfilePicUrl(chat); return { content: [{ type: "text", text: url || "No profile picture." }] }; });
+
+server.tool("whatsapp_status", "Get a contact's status/bio.", { chat: z.string() },
+    async ({ chat }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.getStatus(chat)) }] }; });
+
+server.tool("whatsapp_update_status", "Update your WhatsApp status/bio.", { status: z.string() },
+    async ({ status }) => { const wa = await import("./integrations/whatsapp.js"); await wa.updateMyStatus(status); return { content: [{ type: "text", text: "Status updated." }] }; });
+
+server.tool("whatsapp_presence", "Send presence update (typing indicator, online, etc.).",
+    { type: z.enum(["available", "unavailable", "composing", "paused", "recording"]), chat: z.string().optional().describe("Chat to show typing in") },
+    async ({ type, chat }) => { const wa = await import("./integrations/whatsapp.js"); await wa.sendPresence(type, chat); return { content: [{ type: "text", text: `Presence set to ${type}.` }] }; });
+
+server.tool("whatsapp_add_contact", "Create or update a contact.", { phone: z.string(), name: z.string() },
+    async ({ phone, name }) => { const wa = await import("./integrations/whatsapp.js"); await wa.addOrEditContact(phone, name); return { content: [{ type: "text", text: `Contact ${name} saved.` }] }; });
+
+// WhatsApp Chat Management
+server.tool("whatsapp_chat_modify", "Archive, unarchive, mute, unmute, pin, or unpin a chat.",
+    { chat: z.string(), action: z.enum(["archive", "unarchive", "mute", "unmute", "pin", "unpin"]) },
+    async ({ chat, action }) => { const wa = await import("./integrations/whatsapp.js"); await wa.modifyChat(chat, action); return { content: [{ type: "text", text: `Chat ${action}d.` }] }; });
+
+server.tool("whatsapp_star", "Star or unstar messages.", { chat: z.string(), message_ids: z.array(z.string()), star: z.boolean() },
+    async ({ chat, message_ids, star }) => { const wa = await import("./integrations/whatsapp.js"); await wa.starMessages(chat, message_ids, star); return { content: [{ type: "text", text: star ? "Messages starred." : "Messages unstarred." }] }; });
+
+server.tool("whatsapp_mark_read", "Mark a chat as read.", { chat: z.string() },
+    async ({ chat }) => { const wa = await import("./integrations/whatsapp.js"); await wa.markRead(chat); return { content: [{ type: "text", text: "Marked as read." }] }; });
+
+// WhatsApp Privacy
+server.tool("whatsapp_block", "Block a contact.", { chat: z.string() },
+    async ({ chat }) => { const wa = await import("./integrations/whatsapp.js"); await wa.blockContact(chat); return { content: [{ type: "text", text: "Blocked." }] }; });
+
+server.tool("whatsapp_unblock", "Unblock a contact.", { chat: z.string() },
+    async ({ chat }) => { const wa = await import("./integrations/whatsapp.js"); await wa.unblockContact(chat); return { content: [{ type: "text", text: "Unblocked." }] }; });
+
+server.tool("whatsapp_blocklist", "List all blocked contacts.", {},
+    async () => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.getBlocklist()) }] }; });
+
+// WhatsApp Groups
+server.tool("whatsapp_group_info", "Get group metadata (members, description, settings).", { group: z.string() },
+    async ({ group }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.getGroupMetadata(group)) }] }; });
+
+server.tool("whatsapp_group_create", "Create a new WhatsApp group.", { name: z.string(), participants: z.array(z.string()).describe("Phone numbers or JIDs") },
+    async ({ name, participants }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.createGroup(name, participants)) }] }; });
+
+server.tool("whatsapp_group_participants", "Add, remove, promote, or demote group members.",
+    { group: z.string(), participants: z.array(z.string()), action: z.enum(["add", "remove", "promote", "demote"]) },
+    async ({ group, participants, action }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.updateGroupParticipants(group, participants, action)) }] }; });
+
+server.tool("whatsapp_group_update_name", "Change a group's name.", { group: z.string(), name: z.string() },
+    async ({ group, name }) => { const wa = await import("./integrations/whatsapp.js"); await wa.updateGroupSubject(group, name); return { content: [{ type: "text", text: "Group name updated." }] }; });
+
+server.tool("whatsapp_group_update_description", "Change a group's description.", { group: z.string(), description: z.string() },
+    async ({ group, description }) => { const wa = await import("./integrations/whatsapp.js"); await wa.updateGroupDescription(group, description); return { content: [{ type: "text", text: "Group description updated." }] }; });
+
+server.tool("whatsapp_groups_list", "List all groups you're participating in.", {},
+    async () => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.getAllGroups()) }] }; });
+
+server.tool("whatsapp_group_invite", "Get the invite link for a group.", { group: z.string() },
+    async ({ group }) => { const wa = await import("./integrations/whatsapp.js"); const code = await wa.getGroupInviteCode(group); return { content: [{ type: "text", text: `https://chat.whatsapp.com/${code}` }] }; });
+
+server.tool("whatsapp_group_leave", "Leave a WhatsApp group.", { group: z.string() },
+    async ({ group }) => { const wa = await import("./integrations/whatsapp.js"); await wa.leaveGroup(group); return { content: [{ type: "text", text: "Left group." }] }; });
+
+// WhatsApp Newsletters/Channels
+server.tool("whatsapp_newsletter_create", "Create a new WhatsApp channel.", { name: z.string(), description: z.string().optional() },
+    async ({ name, description }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.createNewsletter(name, description)) }] }; });
+
+server.tool("whatsapp_newsletter_follow", "Follow a WhatsApp channel.", { jid: z.string() },
+    async ({ jid }) => { const wa = await import("./integrations/whatsapp.js"); await wa.followNewsletter(jid); return { content: [{ type: "text", text: "Followed." }] }; });
+
+server.tool("whatsapp_newsletter_unfollow", "Unfollow a WhatsApp channel.", { jid: z.string() },
+    async ({ jid }) => { const wa = await import("./integrations/whatsapp.js"); await wa.unfollowNewsletter(jid); return { content: [{ type: "text", text: "Unfollowed." }] }; });
+
+server.tool("whatsapp_newsletter_messages", "Get messages from a WhatsApp channel.", { jid: z.string(), count: z.number().optional() },
+    async ({ jid, count }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.getNewsletterMessages(jid, count || 20)) }] }; });
+
+server.tool("whatsapp_newsletter_info", "Get info about a WhatsApp channel.", { jid: z.string() },
+    async ({ jid }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.getNewsletterMetadata(jid)) }] }; });
+
+// WhatsApp Business
+server.tool("whatsapp_business_profile", "Get a business profile.", { chat: z.string() },
+    async ({ chat }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.getBusinessProfile(chat)) }] }; });
+
+server.tool("whatsapp_catalog", "Get a business's product catalog.", { chat: z.string(), limit: z.number().optional() },
+    async ({ chat, limit }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.getCatalog(chat, limit || 50)) }] }; });
 
 // ── Credential Management ────────────────────────────────────────────────────
 
@@ -1231,11 +1312,83 @@ function registerAllTools(s: McpServer) {
             return { content: [{ type: "text", text: `WhatsApp connection state: ${wa.getConnectionState().state}. Try again.` }] };
         });
     s.tool("whatsapp_chats", "List WhatsApp chats with last message and unread count.", { limit: z.number().optional() },
-        async ({ limit }) => { const wa = await import("./integrations/whatsapp.js"); const chats = await wa.getChats(limit || 30); return { content: [{ type: "text", text: json(chats) }] }; });
-    s.tool("whatsapp_read", "Read messages from a WhatsApp chat. Pass chat ID, phone number, or contact name.", { chat: z.string().describe("Chat ID, phone number (e.g. +919876543210), or contact name"), limit: z.number().optional() },
-        async ({ chat, limit }) => { const wa = await import("./integrations/whatsapp.js"); const messages = await wa.readMessages(chat, limit || 30); return { content: [{ type: "text", text: json(messages) }] }; });
-    s.tool("whatsapp_send", "Send a WhatsApp message.", { to: z.string().describe("Phone number, contact name, or chat ID"), text: z.string() },
-        async ({ to, text }) => { const wa = await import("./integrations/whatsapp.js"); const result = await wa.sendMessage(to, text); return { content: [{ type: "text", text: json(result) }] }; });
+        async ({ limit }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.getChats(limit || 30)) }] }; });
+    s.tool("whatsapp_search_chats", "Search WhatsApp chats by name.", { query: z.string(), limit: z.number().optional() },
+        async ({ query, limit }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.searchChats(query, limit || 20)) }] }; });
+    s.tool("whatsapp_read", "Read messages from a WhatsApp chat with pagination and search.",
+        { chat: z.string().describe("Chat ID, phone number, or contact name"), limit: z.number().optional(), offset: z.number().optional().describe("Skip N most recent messages"), query: z.string().optional().describe("Filter messages containing this text"), before: z.number().optional().describe("Unix timestamp cursor — only messages before this time") },
+        async ({ chat, limit, offset, query, before }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.readMessages(chat, { limit: limit || 30, offset, query, before })) }] }; });
+    s.tool("whatsapp_search", "Search messages across all WhatsApp chats by text content.",
+        { query: z.string(), chat: z.string().optional().describe("Limit search to a specific chat"), limit: z.number().optional() },
+        async ({ query, chat, limit }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.searchMessages(query, { chatId: chat, limit: limit || 30 })) }] }; });
+    s.tool("whatsapp_send", "Send a WhatsApp text message.", { to: z.string().describe("Phone number, contact name, or chat ID"), text: z.string() },
+        async ({ to, text }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.sendMessage(to, text)) }] }; });
+    s.tool("whatsapp_send_media", "Send media (image, video, document, audio, sticker) on WhatsApp.",
+        { to: z.string(), type: z.enum(["image", "video", "document", "audio", "sticker"]), url: z.string().describe("File URL or local path"), caption: z.string().optional(), filename: z.string().optional(), mimetype: z.string().optional() },
+        async ({ to, type, url, caption, filename, mimetype }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.sendMedia(to, { type, url, caption, filename, mimetype })) }] }; });
+    s.tool("whatsapp_send_location", "Send a location on WhatsApp.", { to: z.string(), latitude: z.number(), longitude: z.number(), name: z.string().optional() },
+        async ({ to, latitude, longitude, name }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.sendLocation(to, latitude, longitude, name)) }] }; });
+    s.tool("whatsapp_send_contact", "Send a contact card on WhatsApp.", { to: z.string(), contact_name: z.string(), contact_phone: z.string().describe("Phone number without + prefix") },
+        async ({ to, contact_name, contact_phone }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.sendContact(to, contact_name, contact_phone)) }] }; });
+    s.tool("whatsapp_check_number", "Check if a phone number is on WhatsApp.", { phone: z.string() },
+        async ({ phone }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.checkOnWhatsApp(phone)) }] }; });
+    s.tool("whatsapp_find_contact", "Search contacts by name or phone number.", { query: z.string() },
+        async ({ query }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.findContact(query)) }] }; });
+    s.tool("whatsapp_profile_pic", "Get profile picture URL for a contact or group.", { chat: z.string() },
+        async ({ chat }) => { const wa = await import("./integrations/whatsapp.js"); const url = await wa.getProfilePicUrl(chat); return { content: [{ type: "text", text: url || "No profile picture." }] }; });
+    s.tool("whatsapp_status", "Get a contact's status/bio.", { chat: z.string() },
+        async ({ chat }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.getStatus(chat)) }] }; });
+    s.tool("whatsapp_update_status", "Update your WhatsApp status/bio.", { status: z.string() },
+        async ({ status }) => { const wa = await import("./integrations/whatsapp.js"); await wa.updateMyStatus(status); return { content: [{ type: "text", text: "Status updated." }] }; });
+    s.tool("whatsapp_presence", "Send presence update (typing indicator, online, etc.).",
+        { type: z.enum(["available", "unavailable", "composing", "paused", "recording"]), chat: z.string().optional().describe("Chat to show typing in") },
+        async ({ type, chat }) => { const wa = await import("./integrations/whatsapp.js"); await wa.sendPresence(type, chat); return { content: [{ type: "text", text: `Presence set to ${type}.` }] }; });
+    s.tool("whatsapp_add_contact", "Create or update a contact.", { phone: z.string(), name: z.string() },
+        async ({ phone, name }) => { const wa = await import("./integrations/whatsapp.js"); await wa.addOrEditContact(phone, name); return { content: [{ type: "text", text: `Contact ${name} saved.` }] }; });
+    s.tool("whatsapp_chat_modify", "Archive, unarchive, mute, unmute, pin, or unpin a chat.",
+        { chat: z.string(), action: z.enum(["archive", "unarchive", "mute", "unmute", "pin", "unpin"]) },
+        async ({ chat, action }) => { const wa = await import("./integrations/whatsapp.js"); await wa.modifyChat(chat, action); return { content: [{ type: "text", text: `Chat ${action}d.` }] }; });
+    s.tool("whatsapp_star", "Star or unstar messages.", { chat: z.string(), message_ids: z.array(z.string()), star: z.boolean() },
+        async ({ chat, message_ids, star }) => { const wa = await import("./integrations/whatsapp.js"); await wa.starMessages(chat, message_ids, star); return { content: [{ type: "text", text: star ? "Messages starred." : "Messages unstarred." }] }; });
+    s.tool("whatsapp_mark_read", "Mark a chat as read.", { chat: z.string() },
+        async ({ chat }) => { const wa = await import("./integrations/whatsapp.js"); await wa.markRead(chat); return { content: [{ type: "text", text: "Marked as read." }] }; });
+    s.tool("whatsapp_block", "Block a contact.", { chat: z.string() },
+        async ({ chat }) => { const wa = await import("./integrations/whatsapp.js"); await wa.blockContact(chat); return { content: [{ type: "text", text: "Blocked." }] }; });
+    s.tool("whatsapp_unblock", "Unblock a contact.", { chat: z.string() },
+        async ({ chat }) => { const wa = await import("./integrations/whatsapp.js"); await wa.unblockContact(chat); return { content: [{ type: "text", text: "Unblocked." }] }; });
+    s.tool("whatsapp_blocklist", "List all blocked contacts.", {},
+        async () => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.getBlocklist()) }] }; });
+    s.tool("whatsapp_group_info", "Get group metadata (members, description, settings).", { group: z.string() },
+        async ({ group }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.getGroupMetadata(group)) }] }; });
+    s.tool("whatsapp_group_create", "Create a new WhatsApp group.", { name: z.string(), participants: z.array(z.string()).describe("Phone numbers or JIDs") },
+        async ({ name, participants }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.createGroup(name, participants)) }] }; });
+    s.tool("whatsapp_group_participants", "Add, remove, promote, or demote group members.",
+        { group: z.string(), participants: z.array(z.string()), action: z.enum(["add", "remove", "promote", "demote"]) },
+        async ({ group, participants, action }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.updateGroupParticipants(group, participants, action)) }] }; });
+    s.tool("whatsapp_group_update_name", "Change a group's name.", { group: z.string(), name: z.string() },
+        async ({ group, name }) => { const wa = await import("./integrations/whatsapp.js"); await wa.updateGroupSubject(group, name); return { content: [{ type: "text", text: "Group name updated." }] }; });
+    s.tool("whatsapp_group_update_description", "Change a group's description.", { group: z.string(), description: z.string() },
+        async ({ group, description }) => { const wa = await import("./integrations/whatsapp.js"); await wa.updateGroupDescription(group, description); return { content: [{ type: "text", text: "Group description updated." }] }; });
+    s.tool("whatsapp_groups_list", "List all groups you're participating in.", {},
+        async () => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.getAllGroups()) }] }; });
+    s.tool("whatsapp_group_invite", "Get the invite link for a group.", { group: z.string() },
+        async ({ group }) => { const wa = await import("./integrations/whatsapp.js"); const code = await wa.getGroupInviteCode(group); return { content: [{ type: "text", text: `https://chat.whatsapp.com/${code}` }] }; });
+    s.tool("whatsapp_group_leave", "Leave a WhatsApp group.", { group: z.string() },
+        async ({ group }) => { const wa = await import("./integrations/whatsapp.js"); await wa.leaveGroup(group); return { content: [{ type: "text", text: "Left group." }] }; });
+    s.tool("whatsapp_newsletter_create", "Create a new WhatsApp channel.", { name: z.string(), description: z.string().optional() },
+        async ({ name, description }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.createNewsletter(name, description)) }] }; });
+    s.tool("whatsapp_newsletter_follow", "Follow a WhatsApp channel.", { jid: z.string() },
+        async ({ jid }) => { const wa = await import("./integrations/whatsapp.js"); await wa.followNewsletter(jid); return { content: [{ type: "text", text: "Followed." }] }; });
+    s.tool("whatsapp_newsletter_unfollow", "Unfollow a WhatsApp channel.", { jid: z.string() },
+        async ({ jid }) => { const wa = await import("./integrations/whatsapp.js"); await wa.unfollowNewsletter(jid); return { content: [{ type: "text", text: "Unfollowed." }] }; });
+    s.tool("whatsapp_newsletter_messages", "Get messages from a WhatsApp channel.", { jid: z.string(), count: z.number().optional() },
+        async ({ jid, count }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.getNewsletterMessages(jid, count || 20)) }] }; });
+    s.tool("whatsapp_newsletter_info", "Get info about a WhatsApp channel.", { jid: z.string() },
+        async ({ jid }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.getNewsletterMetadata(jid)) }] }; });
+    s.tool("whatsapp_business_profile", "Get a business profile.", { chat: z.string() },
+        async ({ chat }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.getBusinessProfile(chat)) }] }; });
+    s.tool("whatsapp_catalog", "Get a business's product catalog.", { chat: z.string(), limit: z.number().optional() },
+        async ({ chat, limit }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.getCatalog(chat, limit || 50)) }] }; });
 }
 
 main().catch(console.error);
