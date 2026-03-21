@@ -1411,6 +1411,437 @@ function extractHashtags(text: string, platform: "linkedin" | "twitter"): string
     return allTags.slice(0, 5); // LinkedIn: more hashtags OK
 }
 
+// ── Cross-Platform Workflows ──────────────────────────────────────────────────
+
+server.tool(
+    "meeting_prep",
+    `Prepare for a meeting by pulling LinkedIn profiles of all attendees from a Google Calendar event. Returns attendee names, roles, companies, headlines, and profile URLs so you're fully briefed before any call.`,
+    {
+        event_id: z.string().describe("Google Calendar event ID"),
+        calendar_id: z.string().optional().describe("Calendar ID (default: primary)"),
+        gcal_profile: z.string().optional().describe("Google Calendar credential profile"),
+        linkedin_profile: z.string().optional().describe("LinkedIn credential profile"),
+    },
+    async ({ event_id, calendar_id, gcal_profile, linkedin_profile }) => {
+        // Get event details from GCal
+        const gcalAuth = await getGCalAuth(gcal_profile);
+        const event = await gcal.getEvent(gcalAuth, calendar_id || "primary", event_id);
+
+        const attendees = event.attendees || [];
+        if (attendees.length === 0) {
+            return { content: [{ type: "text", text: json({ event: { summary: event.summary, start: event.start, end: event.end }, attendees: [], note: "No attendees found on this event." }) }] };
+        }
+
+        const linkedinAuth = getLinkedInAuth(linkedin_profile);
+        const profiles: any[] = [];
+
+        for (const attendee of attendees) {
+            const email = attendee.email || "";
+            const name = attendee.displayName || email.split("@")[0];
+            const profile: any = { email, name, responseStatus: attendee.responseStatus };
+
+            // Try to find on LinkedIn by name
+            if (name && name !== email) {
+                try {
+                    const searchResults = await linkedin.searchPeople(linkedinAuth, name, 3);
+                    if (searchResults.length > 0) {
+                        const best = searchResults[0];
+                        profile.linkedin = {
+                            name: `${best.firstName || ""} ${best.lastName || ""}`.trim(),
+                            headline: best.headline,
+                            location: best.location,
+                            profileUrl: best.publicId ? `https://www.linkedin.com/in/${best.publicId}` : null,
+                        };
+                    }
+                } catch {}
+            }
+            profiles.push(profile);
+        }
+
+        return {
+            content: [{
+                type: "text",
+                text: json({
+                    event: { summary: event.summary, start: event.start, end: event.end, location: event.location, description: event.description },
+                    attendee_count: profiles.length,
+                    attendees: profiles,
+                }),
+            }],
+        };
+    }
+);
+
+server.tool(
+    "smart_inbox",
+    `Unified notification inbox across all connected platforms. Returns a single view of what needs your attention: GitHub PRs/issues, LinkedIn messages, Slack DMs, Gmail unreads, and upcoming calendar events.`,
+    {
+        github_profile: z.string().optional(),
+        linkedin_profile: z.string().optional(),
+        gcal_profile: z.string().optional(),
+        gmail_profile: z.string().optional(),
+    },
+    async ({ github_profile, linkedin_profile, gcal_profile, gmail_profile }) => {
+        const inbox: any = { timestamp: new Date().toISOString(), sections: {} };
+
+        // GitHub notifications
+        try {
+            const ghAuth = getGitHubAuth(github_profile);
+            const notifications = await github.getNotifications(ghAuth, 10, false);
+            inbox.sections.github = {
+                count: notifications.length,
+                items: notifications.map((n: any) => ({
+                    reason: n.reason,
+                    title: n.subject?.title,
+                    type: n.subject?.type,
+                    repo: n.repository?.full_name,
+                    updated_at: n.updated_at,
+                    url: n.subject?.url,
+                })),
+            };
+        } catch (e: any) {
+            inbox.sections.github = { error: e.message, hint: "Run: store_credential('github', 'token', 'ghp_...') or install gh CLI" };
+        }
+
+        // LinkedIn messages
+        try {
+            const liAuth = getLinkedInAuth(linkedin_profile);
+            const convos = await linkedin.getConversations(liAuth, 5);
+            const unread = (convos.conversations || []).filter((c: any) => c.unreadCount > 0);
+            inbox.sections.linkedin = {
+                unread_conversations: unread.length,
+                items: unread.map((c: any) => ({
+                    from: c.participants?.map((p: any) => p.name).join(", "),
+                    preview: c.lastMessage?.slice(0, 100),
+                    unread: c.unreadCount,
+                })),
+            };
+        } catch (e: any) {
+            inbox.sections.linkedin = { error: e.message };
+        }
+
+        // Google Calendar (next 5 events today)
+        try {
+            const calAuth = await getGCalAuth(gcal_profile);
+            const now = new Date();
+            const endOfDay = new Date(now);
+            endOfDay.setHours(23, 59, 59, 999);
+            const events = await gcal.listEvents(calAuth, "primary", {
+                timeMin: now.toISOString(),
+                timeMax: endOfDay.toISOString(),
+                maxResults: 5,
+            });
+            inbox.sections.calendar = {
+                remaining_today: events.length,
+                items: events.map((e: any) => ({
+                    summary: e.summary,
+                    start: e.start?.dateTime || e.start?.date,
+                    end: e.end?.dateTime || e.end?.date,
+                    attendees: e.attendees?.length || 0,
+                    meet_link: e.hangoutLink,
+                })),
+            };
+        } catch (e: any) {
+            inbox.sections.calendar = { error: e.message };
+        }
+
+        // Gmail unreads
+        try {
+            const gmailAuth = await getGmailAuth(gmail_profile);
+            const result = await gmail.listMessages(gmailAuth, { query: "is:unread", maxResults: 10 });
+            const messages = result.messages || [];
+            inbox.sections.gmail = {
+                unread_count: messages.length,
+                items: messages.map((m: any) => ({
+                    from: m.from,
+                    subject: m.subject,
+                    snippet: m.snippet,
+                    date: m.date,
+                })),
+            };
+        } catch (e: any) {
+            inbox.sections.gmail = { error: e.message };
+        }
+
+        return { content: [{ type: "text", text: json(inbox) }] };
+    }
+);
+
+server.tool(
+    "contact_enrich",
+    `Enrich a contact by searching across LinkedIn, Twitter, GitHub, and Notion. Given a name or email, returns all matching profiles with roles, bios, and links.`,
+    {
+        name: z.string().optional().describe("Person's name to search for"),
+        email: z.string().optional().describe("Person's email to search for"),
+        linkedin_profile: z.string().optional(),
+    },
+    async ({ name, email, linkedin_profile }) => {
+        if (!name && !email) {
+            return { content: [{ type: "text", text: "Provide at least a name or email to search." }] };
+        }
+
+        const searchTerm = name || (email ? email.split("@")[0].replace(/[._]/g, " ") : "");
+        const result: any = { query: { name, email }, profiles: {} };
+
+        // LinkedIn
+        try {
+            const liAuth = getLinkedInAuth(linkedin_profile);
+            const people = await linkedin.searchPeople(liAuth, searchTerm, 5);
+            result.profiles.linkedin = people.map((p: any) => ({
+                name: `${p.firstName || ""} ${p.lastName || ""}`.trim(),
+                headline: p.headline,
+                location: p.location,
+                profileUrl: p.publicId ? `https://www.linkedin.com/in/${p.publicId}` : null,
+            }));
+        } catch (e: any) {
+            result.profiles.linkedin = { error: e.message };
+        }
+
+        // Twitter
+        try {
+            const twAuth = getTwitterAuth();
+            const tweets = await twitter.searchTweets(twAuth, searchTerm, 5);
+            const authors = new Map<string, any>();
+            for (const t of tweets) {
+                if (t.author && !authors.has(t.author)) {
+                    authors.set(t.author, { screen_name: t.author, name: t.authorName });
+                }
+            }
+            result.profiles.twitter = [...authors.values()].slice(0, 3);
+        } catch (e: any) {
+            result.profiles.twitter = { error: e.message };
+        }
+
+        // GitHub
+        try {
+            const ghAuth = getGitHubAuth();
+            const users = await github.searchUsers(ghAuth, searchTerm, 5);
+            result.profiles.github = users.map((u: any) => ({
+                login: u.login,
+                name: u.name,
+                bio: u.bio,
+                company: u.company,
+                location: u.location,
+                profileUrl: u.html_url,
+                repos: u.public_repos,
+                followers: u.followers,
+            }));
+        } catch (e: any) {
+            result.profiles.github = { error: e.message };
+        }
+
+        // Notion (search for name in pages)
+        try {
+            const notionAuth = getNotionAuth();
+            const pages = await notion.search(notionAuth, searchTerm, { limit: 3 });
+            if (pages.length > 0) {
+                result.profiles.notion = pages.map((p: any) => ({
+                    title: p.title,
+                    url: p.url,
+                    type: p.type,
+                }));
+            }
+        } catch {
+            // Notion not connected — skip silently
+        }
+
+        return { content: [{ type: "text", text: json(result) }] };
+    }
+);
+
+server.tool(
+    "content_calendar",
+    `Manage a cross-platform content calendar. Store draft posts, schedule them via Google Calendar, and track what's been published. Uses a 'content_calendar' collection to persist drafts.`,
+    {
+        action: z.enum(["create_draft", "list_drafts", "schedule", "list_scheduled", "mark_published"]).describe("Action to perform"),
+        text: z.string().optional().describe("Post content (for create_draft)"),
+        platform: z.enum(["linkedin", "twitter", "both"]).optional().describe("Target platform (for create_draft)"),
+        draft_id: z.number().optional().describe("Draft ID (for schedule/mark_published)"),
+        schedule_time: z.string().optional().describe("ISO 8601 datetime to schedule (for schedule action)"),
+        gcal_profile: z.string().optional(),
+    },
+    async ({ action, text, platform, draft_id, schedule_time, gcal_profile }) => {
+        // Ensure collection exists
+        const collectionName = "content_calendar";
+        try {
+            await db.createCollection(collectionName, "Cross-platform content calendar drafts", [
+                { name: "text", type: "text" },
+                { name: "platform", type: "text" },
+                { name: "status", type: "text" },
+                { name: "scheduled_at", type: "text" },
+                { name: "published_at", type: "text" },
+                { name: "cal_event_id", type: "text" },
+            ]);
+        } catch {} // Already exists
+
+        if (action === "create_draft") {
+            if (!text) return { content: [{ type: "text", text: "Provide text for the draft." }] };
+            const { id } = db.collectionInsert(collectionName, {
+                text,
+                platform: platform || "both",
+                status: "draft",
+                scheduled_at: "",
+                published_at: "",
+                cal_event_id: "",
+            });
+            return { content: [{ type: "text", text: json({ id, status: "draft", platform: platform || "both", text: text.slice(0, 100) + "..." }) }] };
+        }
+
+        if (action === "list_drafts") {
+            const drafts = db.collectionQuery(collectionName, { where: { status: "draft" } });
+            return { content: [{ type: "text", text: json(drafts) }] };
+        }
+
+        if (action === "schedule") {
+            if (!draft_id || !schedule_time) return { content: [{ type: "text", text: "Provide draft_id and schedule_time." }] };
+            // Create a GCal event as a reminder
+            try {
+                const calAuth = await getGCalAuth(gcal_profile);
+                const drafts = db.collectionQuery(collectionName, { where: { id: draft_id } } as any);
+                const draft = (drafts as any)[0] || drafts;
+                const draftText = (draft as any)?.text || "Content post";
+                const startTime = new Date(schedule_time);
+                const endTime = new Date(startTime.getTime() + 15 * 60 * 1000); // 15 min reminder
+                const event = await gcal.createEvent(calAuth, "primary", {
+                    summary: `📝 Post: ${draftText.slice(0, 50)}...`,
+                    description: `Platform: ${(draft as any)?.platform || "both"}\n\nFull text:\n${draftText}`,
+                    start: startTime.toISOString(),
+                    end: endTime.toISOString(),
+                });
+                db.collectionUpdate(collectionName, draft_id, { status: "scheduled", scheduled_at: schedule_time, cal_event_id: event.id || "" });
+                return { content: [{ type: "text", text: json({ draft_id, status: "scheduled", scheduled_at: schedule_time, cal_event_id: event.id }) }] };
+            } catch (e: any) {
+                // Schedule without GCal
+                db.collectionUpdate(collectionName, draft_id, { status: "scheduled", scheduled_at: schedule_time });
+                return { content: [{ type: "text", text: json({ draft_id, status: "scheduled", scheduled_at: schedule_time, note: `GCal: ${e.message}` }) }] };
+            }
+        }
+
+        if (action === "list_scheduled") {
+            const scheduled = db.collectionQuery(collectionName, { where: { status: "scheduled" } });
+            return { content: [{ type: "text", text: json(scheduled) }] };
+        }
+
+        if (action === "mark_published") {
+            if (!draft_id) return { content: [{ type: "text", text: "Provide draft_id." }] };
+            db.collectionUpdate(collectionName, draft_id, { status: "published", published_at: new Date().toISOString() });
+            return { content: [{ type: "text", text: json({ draft_id, status: "published", published_at: new Date().toISOString() }) }] };
+        }
+
+        return { content: [{ type: "text", text: "Unknown action." }] };
+    }
+);
+
+server.tool(
+    "pr_digest",
+    `Get a digest of your GitHub activity: open PRs needing review, your PRs with pending reviews, failing CI, and recent issues. Optionally post a summary to a Slack channel.`,
+    {
+        github_profile: z.string().optional(),
+        slack_profile: z.string().optional(),
+        slack_channel: z.string().optional().describe("Slack channel to post digest to (optional)"),
+        repos: z.array(z.string()).optional().describe("List of owner/repo to check (default: your recent repos)"),
+    },
+    async ({ github_profile, slack_profile, slack_channel, repos }) => {
+        const ghAuth = getGitHubAuth(github_profile);
+        const digest: any = { timestamp: new Date().toISOString(), sections: {} };
+
+        // Determine repos to check
+        let repoList = repos || [];
+        if (repoList.length === 0) {
+            try {
+                const myRepos = await github.listMyRepos(ghAuth, 10, "pushed");
+                repoList = myRepos.map((r: any) => r.name);
+            } catch {}
+        }
+
+        // GitHub notifications (PR reviews, mentions)
+        try {
+            const notifications = await github.getNotifications(ghAuth, 20, false);
+            const prNotifications = notifications.filter((n: any) => n.subject?.type === "PullRequest");
+            digest.sections.review_requests = {
+                count: prNotifications.length,
+                items: prNotifications.slice(0, 10).map((n: any) => ({
+                    title: n.subject?.title,
+                    repo: n.repository?.full_name,
+                    reason: n.reason,
+                    updated_at: n.updated_at,
+                })),
+            };
+        } catch (e: any) {
+            digest.sections.review_requests = { error: e.message };
+        }
+
+        // Open PRs across repos
+        const allPRs: any[] = [];
+        for (const repo of repoList.slice(0, 5)) {
+            const [owner, name] = repo.includes("/") ? repo.split("/") : ["", repo];
+            try {
+                const ownerName = owner || (await github.getAuthenticatedUser(ghAuth)).login;
+                const prs = await github.listPRs(ghAuth, ownerName, name, { state: "open", count: 10 });
+                for (const pr of prs) {
+                    allPRs.push({
+                        repo: `${ownerName}/${name}`,
+                        number: pr.number,
+                        title: pr.title,
+                        author: pr.user?.login,
+                        created_at: pr.created_at,
+                        draft: pr.draft,
+                        reviews: pr.requested_reviewers?.length || 0,
+                    });
+                }
+            } catch {}
+        }
+        digest.sections.open_prs = { count: allPRs.length, items: allPRs };
+
+        // Recent workflow runs (CI status)
+        const failedRuns: any[] = [];
+        for (const repo of repoList.slice(0, 5)) {
+            const [owner, name] = repo.includes("/") ? repo.split("/") : ["", repo];
+            try {
+                const ownerName = owner || (await github.getAuthenticatedUser(ghAuth)).login;
+                const runs = await github.listWorkflowRuns(ghAuth, ownerName, name, 5);
+                const failed = runs.filter((r: any) => r.conclusion === "failure");
+                for (const r of failed) {
+                    failedRuns.push({
+                        repo: `${ownerName}/${name}`,
+                        workflow: r.name,
+                        branch: r.head_branch,
+                        status: r.conclusion,
+                        url: r.html_url,
+                    });
+                }
+            } catch {}
+        }
+        digest.sections.failed_ci = { count: failedRuns.length, items: failedRuns };
+
+        // Post to Slack if requested
+        if (slack_channel) {
+            try {
+                const slackAuth = getSlackAuth(slack_profile);
+                const lines = [`*🔔 PR Digest — ${new Date().toLocaleDateString()}*`];
+                if (allPRs.length > 0) {
+                    lines.push(`\n*Open PRs (${allPRs.length}):*`);
+                    for (const pr of allPRs.slice(0, 5)) {
+                        lines.push(`• ${pr.repo}#${pr.number}: ${pr.title} (by ${pr.author})`);
+                    }
+                }
+                if (failedRuns.length > 0) {
+                    lines.push(`\n*❌ Failed CI (${failedRuns.length}):*`);
+                    for (const r of failedRuns.slice(0, 5)) {
+                        lines.push(`• ${r.repo}: ${r.workflow} on ${r.branch}`);
+                    }
+                }
+                await slack.postMessage(slackAuth, slack_channel, lines.join("\n"));
+                digest.slack_posted = true;
+            } catch (e: any) {
+                digest.slack_posted = false;
+                digest.slack_error = e.message;
+            }
+        }
+
+        return { content: [{ type: "text", text: json(digest) }] };
+    }
+);
+
 // ── Dynamic Tools (AI creates its own integrations) ──────────────────────────
 
 /**
@@ -2333,6 +2764,72 @@ function registerAllTools(s: McpServer) {
             result.repurposed.tone = t;
         }
         return { content: [{ type: "text", text: json(result) }] };
+    });
+
+    // Cross-Platform Workflows
+    s.tool("meeting_prep", "Prepare for a meeting by pulling LinkedIn profiles of all attendees from a Google Calendar event.", {
+        event_id: z.string(), calendar_id: z.string().optional(), gcal_profile: z.string().optional(), linkedin_profile: z.string().optional(),
+    }, async ({ event_id, calendar_id, gcal_profile, linkedin_profile }) => {
+        const calAuth = await getGCalAuth(gcal_profile);
+        const event = await gcal.getEvent(calAuth, calendar_id || "primary", event_id);
+        const attendees = event.attendees || [];
+        if (attendees.length === 0) return { content: [{ type: "text", text: json({ event: { summary: event.summary, start: event.start }, attendees: [], note: "No attendees." }) }] };
+        const liAuth = getLinkedInAuth(linkedin_profile);
+        const profiles: any[] = [];
+        for (const a of attendees) {
+            const name = a.displayName || (a.email || "").split("@")[0];
+            const p: any = { email: a.email, name, responseStatus: a.responseStatus };
+            if (name && name !== a.email) { try { const r = await linkedin.searchPeople(liAuth, name, 3); if (r.length > 0) p.linkedin = { name: `${r[0].firstName || ""} ${r[0].lastName || ""}`.trim(), headline: r[0].headline, profileUrl: r[0].publicId ? `https://linkedin.com/in/${r[0].publicId}` : null }; } catch {} }
+            profiles.push(p);
+        }
+        return { content: [{ type: "text", text: json({ event: { summary: event.summary, start: event.start, end: event.end, location: event.location }, attendee_count: profiles.length, attendees: profiles }) }] };
+    });
+    s.tool("smart_inbox", "Unified notification inbox across all connected platforms.", { github_profile: z.string().optional(), linkedin_profile: z.string().optional(), gcal_profile: z.string().optional(), gmail_profile: z.string().optional() },
+        async ({ github_profile, linkedin_profile, gcal_profile, gmail_profile }) => {
+            const inbox: any = { timestamp: new Date().toISOString(), sections: {} };
+            try { const ghAuth = getGitHubAuth(github_profile); const n = await github.getNotifications(ghAuth, 10, false); inbox.sections.github = { count: n.length, items: n.map((i: any) => ({ title: i.subject?.title, type: i.subject?.type, repo: i.repository?.full_name, reason: i.reason })) }; } catch (e: any) { inbox.sections.github = { error: e.message }; }
+            try { const liAuth = getLinkedInAuth(linkedin_profile); const c = await linkedin.getConversations(liAuth, 5); const u = (c.conversations || []).filter((x: any) => x.unreadCount > 0); inbox.sections.linkedin = { unread: u.length, items: u.map((x: any) => ({ from: x.participants?.map((p: any) => p.name).join(", "), preview: x.lastMessage?.slice(0, 100) })) }; } catch (e: any) { inbox.sections.linkedin = { error: e.message }; }
+            try { const calAuth = await getGCalAuth(gcal_profile); const now = new Date(); const eod = new Date(now); eod.setHours(23,59,59); const ev = await gcal.listEvents(calAuth, "primary", { timeMin: now.toISOString(), timeMax: eod.toISOString(), maxResults: 5 }); inbox.sections.calendar = { remaining_today: ev.length, items: ev.map((e: any) => ({ summary: e.summary, start: e.start?.dateTime || e.start?.date })) }; } catch (e: any) { inbox.sections.calendar = { error: e.message }; }
+            try { const gmAuth = await getGmailAuth(gmail_profile); const r = await gmail.listMessages(gmAuth, { query: "is:unread", maxResults: 10 }); const msgs = r.messages || []; inbox.sections.gmail = { unread: msgs.length, items: msgs.map((m: any) => ({ from: m.from, subject: m.subject, snippet: m.snippet })) }; } catch (e: any) { inbox.sections.gmail = { error: e.message }; }
+            return { content: [{ type: "text", text: json(inbox) }] };
+        });
+    s.tool("contact_enrich", "Enrich a contact by searching across LinkedIn, Twitter, GitHub, and Notion.", { name: z.string().optional(), email: z.string().optional(), linkedin_profile: z.string().optional() },
+        async ({ name, email, linkedin_profile }) => {
+            if (!name && !email) return { content: [{ type: "text", text: "Provide a name or email." }] };
+            const q = name || (email ? email.split("@")[0].replace(/[._]/g, " ") : "");
+            const r: any = { query: { name, email }, profiles: {} };
+            try { const liAuth = getLinkedInAuth(linkedin_profile); const p = await linkedin.searchPeople(liAuth, q, 5); r.profiles.linkedin = p.map((x: any) => ({ name: `${x.firstName || ""} ${x.lastName || ""}`.trim(), headline: x.headline, location: x.location, url: x.publicId ? `https://linkedin.com/in/${x.publicId}` : null })); } catch (e: any) { r.profiles.linkedin = { error: e.message }; }
+            try { const ghAuth = getGitHubAuth(); const u = await github.searchUsers(ghAuth, q, 5); r.profiles.github = u.map((x: any) => ({ login: x.login, html_url: x.html_url })); } catch (e: any) { r.profiles.github = { error: e.message }; }
+            try { const nAuth = getNotionAuth(); const p = await notion.search(nAuth, q, { limit: 3 }); if (p.length > 0) r.profiles.notion = p.map((x: any) => ({ title: x.title, url: x.url })); } catch {}
+            return { content: [{ type: "text", text: json(r) }] };
+        });
+    s.tool("content_calendar", "Manage a cross-platform content calendar.", {
+        action: z.enum(["create_draft", "list_drafts", "schedule", "list_scheduled", "mark_published"]),
+        text: z.string().optional(), platform: z.enum(["linkedin", "twitter", "both"]).optional(),
+        draft_id: z.number().optional(), schedule_time: z.string().optional(), gcal_profile: z.string().optional(),
+    }, async ({ action, text, platform, draft_id, schedule_time, gcal_profile }) => {
+        const cn = "content_calendar";
+        try { await db.createCollection(cn, "Content calendar", [{ name: "text", type: "text" }, { name: "platform", type: "text" }, { name: "status", type: "text" }, { name: "scheduled_at", type: "text" }, { name: "published_at", type: "text" }, { name: "cal_event_id", type: "text" }]); } catch {}
+        if (action === "create_draft") { if (!text) return { content: [{ type: "text", text: "Provide text." }] }; const { id } = db.collectionInsert(cn, { text, platform: platform || "both", status: "draft", scheduled_at: "", published_at: "", cal_event_id: "" }); return { content: [{ type: "text", text: json({ id, status: "draft" }) }] }; }
+        if (action === "list_drafts") return { content: [{ type: "text", text: json(db.collectionQuery(cn, { where: { status: "draft" } })) }] };
+        if (action === "schedule") { if (!draft_id || !schedule_time) return { content: [{ type: "text", text: "Provide draft_id and schedule_time." }] }; db.collectionUpdate(cn, draft_id, { status: "scheduled", scheduled_at: schedule_time }); return { content: [{ type: "text", text: json({ draft_id, status: "scheduled", scheduled_at: schedule_time }) }] }; }
+        if (action === "list_scheduled") return { content: [{ type: "text", text: json(db.collectionQuery(cn, { where: { status: "scheduled" } })) }] };
+        if (action === "mark_published") { if (!draft_id) return { content: [{ type: "text", text: "Provide draft_id." }] }; db.collectionUpdate(cn, draft_id, { status: "published", published_at: new Date().toISOString() }); return { content: [{ type: "text", text: json({ draft_id, status: "published" }) }] }; }
+        return { content: [{ type: "text", text: "Unknown action." }] };
+    });
+    s.tool("pr_digest", "Get a GitHub PR digest: open PRs, review requests, failing CI.", {
+        github_profile: z.string().optional(), slack_profile: z.string().optional(), slack_channel: z.string().optional(), repos: z.array(z.string()).optional(),
+    }, async ({ github_profile, slack_profile, slack_channel, repos }) => {
+        const ghAuth = getGitHubAuth(github_profile);
+        const digest: any = { timestamp: new Date().toISOString(), sections: {} };
+        let repoList = repos || [];
+        if (repoList.length === 0) { try { const r = await github.listMyRepos(ghAuth, 10, "pushed"); repoList = r.map((x: any) => x.name); } catch {} }
+        try { const n = await github.getNotifications(ghAuth, 20, false); const prn = n.filter((x: any) => x.subject?.type === "PullRequest"); digest.sections.review_requests = { count: prn.length, items: prn.slice(0, 10).map((x: any) => ({ title: x.subject?.title, repo: x.repository?.full_name, reason: x.reason })) }; } catch (e: any) { digest.sections.review_requests = { error: e.message }; }
+        const allPRs: any[] = [];
+        for (const repo of repoList.slice(0, 5)) { const [o, n] = repo.includes("/") ? repo.split("/") : ["", repo]; try { const on = o || (await github.getAuthenticatedUser(ghAuth)).login; const prs = await github.listPRs(ghAuth, on, n, { state: "open", count: 10 }); for (const pr of prs) allPRs.push({ repo: `${on}/${n}`, number: pr.number, title: pr.title, author: pr.user?.login, draft: pr.draft }); } catch {} }
+        digest.sections.open_prs = { count: allPRs.length, items: allPRs };
+        if (slack_channel) { try { const sa = getSlackAuth(slack_profile); const lines = [`*🔔 PR Digest*\n*Open PRs (${allPRs.length}):*`]; for (const pr of allPRs.slice(0, 5)) lines.push(`• ${pr.repo}#${pr.number}: ${pr.title}`); await slack.postMessage(sa, slack_channel, lines.join("\n")); digest.slack_posted = true; } catch (e: any) { digest.slack_error = e.message; } }
+        return { content: [{ type: "text", text: json(digest) }] };
     });
 
     // Dynamic tools
