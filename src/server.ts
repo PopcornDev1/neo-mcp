@@ -23,6 +23,7 @@ import * as gmail from "./integrations/gmail.js";
 import * as github from "./integrations/github.js";
 import * as gcal from "./integrations/gcal.js";
 import * as notion from "./integrations/notion.js";
+import * as discord from "./integrations/discord.js";
 import * as db from "./db.js";
 import { browserCommand, startBridge, isBridgeConnected } from "./bridge.js";
 
@@ -33,6 +34,7 @@ const NEO_INSTRUCTIONS = `Neo is a browser bridge that lets you operate the user
 - Twitter/X: extract_auth("twitter") once, then use twitter_* tools
 - GitHub: Auto-detects gh CLI token, or use store_credential("github", "token", "ghp_...") with a PAT. Then use github_* tools (repos, issues, PRs, actions, gists, search)
 - Notion: extract_auth("notion") once, then use notion_* tools (pages, databases, search, create/edit)
+- Discord: extract_auth("discord") once, then use discord_* tools (servers, channels, messages, DMs, reactions)
 - Slack: extract_auth("slack") once, then use slack_* tools
 - Google Calendar: gcal_connect (OAuth sign-in, then use gcal_* tools for events, scheduling, free/busy)
 - Gmail: gmail_connect (OAuth sign-in, supports multiple accounts via profile param)
@@ -161,6 +163,13 @@ function getNotionAuth(profile?: string): notion.NotionAuth {
     const token = creds.token_v2 || "";
     if (!token && !creds._cookies) throw new Error(`Missing token_v2. Run extract_auth for notion${profile ? ` (profile: ${profile})` : ""}.`);
     return { token_v2: token, _cookies: creds._cookies };
+}
+
+function getDiscordAuth(profile?: string): discord.DiscordAuth {
+    const creds = getAuth(profileKey("discord", profile));
+    const token = creds.token || "";
+    if (!token) throw new Error(`Discord not connected. Run extract_auth("discord") first${profile ? ` (profile: ${profile})` : ""}.`);
+    return { token, _cookies: creds._cookies };
 }
 
 function getSlackAuth(profile?: string): slack.SlackAuth {
@@ -678,6 +687,39 @@ server.tool("notion_database", "Query a Notion database (collection).", { collec
     async ({ collection_id, view_id, limit, query, profile }) => ({ content: [{ type: "text", text: json(await notion.queryDatabase(getNotionAuth(profile), collection_id, view_id, { limit, query })) }] }));
 server.tool("notion_recent", "Get your recently visited Notion pages.", { limit: z.number().optional(), ...profileParam },
     async ({ limit, profile }) => ({ content: [{ type: "text", text: json(await notion.getRecentPages(getNotionAuth(profile), limit || 20)) }] }));
+
+// ── Discord ───────────────────────────────────────────────────────────────────
+
+server.tool("discord_me", "Get your Discord profile.", { ...profileParam },
+    async ({ profile }) => ({ content: [{ type: "text", text: json(await discord.getMe(getDiscordAuth(profile))) }] }));
+server.tool("discord_guilds", "List your Discord servers.", { ...profileParam },
+    async ({ profile }) => ({ content: [{ type: "text", text: json(await discord.listGuilds(getDiscordAuth(profile))) }] }));
+server.tool("discord_guild", "Get Discord server details.", { guild_id: z.string(), ...profileParam },
+    async ({ guild_id, profile }) => ({ content: [{ type: "text", text: json(await discord.getGuild(getDiscordAuth(profile), guild_id)) }] }));
+server.tool("discord_channels", "List channels in a Discord server.", { guild_id: z.string(), ...profileParam },
+    async ({ guild_id, profile }) => ({ content: [{ type: "text", text: json(await discord.listChannels(getDiscordAuth(profile), guild_id)) }] }));
+server.tool("discord_messages", "Read messages from a Discord channel.", { channel_id: z.string(), limit: z.number().optional(), ...profileParam },
+    async ({ channel_id, limit, profile }) => ({ content: [{ type: "text", text: json(await discord.readMessages(getDiscordAuth(profile), channel_id, limit || 50)) }] }));
+server.tool("discord_send", "Send a message to a Discord channel.", { channel_id: z.string(), content: z.string(), ...profileParam },
+    async ({ channel_id, content, profile }) => ({ content: [{ type: "text", text: json(await discord.sendMessage(getDiscordAuth(profile), channel_id, content)) }] }));
+server.tool("discord_channel", "Get Discord channel info.", { channel_id: z.string(), ...profileParam },
+    async ({ channel_id, profile }) => ({ content: [{ type: "text", text: json(await discord.getChannel(getDiscordAuth(profile), channel_id)) }] }));
+server.tool("discord_search", "Search messages in a Discord server.", { guild_id: z.string(), query: z.string(), limit: z.number().optional(), ...profileParam },
+    async ({ guild_id, query, limit, profile }) => ({ content: [{ type: "text", text: json(await discord.searchMessages(getDiscordAuth(profile), guild_id, query, limit || 25)) }] }));
+server.tool("discord_dms", "List your Discord DM channels.", { ...profileParam },
+    async ({ profile }) => ({ content: [{ type: "text", text: json(await discord.listDMs(getDiscordAuth(profile))) }] }));
+server.tool("discord_read_dm", "Read DM messages.", { channel_id: z.string(), limit: z.number().optional(), ...profileParam },
+    async ({ channel_id, limit, profile }) => ({ content: [{ type: "text", text: json(await discord.readDMs(getDiscordAuth(profile), channel_id, limit || 50)) }] }));
+server.tool("discord_send_dm", "Send a DM to a user.", { user_id: z.string(), content: z.string(), ...profileParam },
+    async ({ user_id, content, profile }) => ({ content: [{ type: "text", text: json(await discord.sendDM(getDiscordAuth(profile), user_id, content)) }] }));
+server.tool("discord_react", "Add a reaction to a message.", { channel_id: z.string(), message_id: z.string(), emoji: z.string(), ...profileParam },
+    async ({ channel_id, message_id, emoji, profile }) => { await discord.addReaction(getDiscordAuth(profile), channel_id, message_id, emoji); return { content: [{ type: "text", text: "Reaction added." }] }; });
+server.tool("discord_unreact", "Remove a reaction from a message.", { channel_id: z.string(), message_id: z.string(), emoji: z.string(), ...profileParam },
+    async ({ channel_id, message_id, emoji, profile }) => { await discord.removeReaction(getDiscordAuth(profile), channel_id, message_id, emoji); return { content: [{ type: "text", text: "Reaction removed." }] }; });
+server.tool("discord_members", "List members of a Discord server.", { guild_id: z.string(), limit: z.number().optional(), ...profileParam },
+    async ({ guild_id, limit, profile }) => ({ content: [{ type: "text", text: json(await discord.getGuildMembers(getDiscordAuth(profile), guild_id, limit || 100)) }] }));
+server.tool("discord_user", "Get a Discord user's profile.", { user_id: z.string(), ...profileParam },
+    async ({ user_id, profile }) => ({ content: [{ type: "text", text: json(await discord.getUserProfile(getDiscordAuth(profile), user_id)) }] }));
 
 // ── Collections (agent-designed data storage) ────────────────────────────────
 
@@ -2150,6 +2192,7 @@ async function main() {
     twitter.setBrowserCommand(browserCommand);
     github.setBrowserCommand(browserCommand);
     notion.setBrowserCommand(browserCommand);
+    discord.setBrowserCommand(browserCommand);
 
     // Load and register all saved custom tools (graceful — db may fail on Linux VM)
     try {
@@ -2563,6 +2606,38 @@ function registerAllTools(s: McpServer) {
         async ({ collection_id, view_id, limit, query, profile }) => ({ content: [{ type: "text", text: json(await notion.queryDatabase(getNotionAuth(profile), collection_id, view_id, { limit, query })) }] }));
     s.tool("notion_recent", "Get recently visited Notion pages.", { limit: z.number().optional(), ...profileParam },
         async ({ limit, profile }) => ({ content: [{ type: "text", text: json(await notion.getRecentPages(getNotionAuth(profile), limit || 20)) }] }));
+
+    // Discord
+    s.tool("discord_me", "Get your Discord profile.", { ...profileParam },
+        async ({ profile }) => ({ content: [{ type: "text", text: json(await discord.getMe(getDiscordAuth(profile))) }] }));
+    s.tool("discord_guilds", "List your Discord servers.", { ...profileParam },
+        async ({ profile }) => ({ content: [{ type: "text", text: json(await discord.listGuilds(getDiscordAuth(profile))) }] }));
+    s.tool("discord_guild", "Get Discord server details.", { guild_id: z.string(), ...profileParam },
+        async ({ guild_id, profile }) => ({ content: [{ type: "text", text: json(await discord.getGuild(getDiscordAuth(profile), guild_id)) }] }));
+    s.tool("discord_channels", "List channels in a Discord server.", { guild_id: z.string(), ...profileParam },
+        async ({ guild_id, profile }) => ({ content: [{ type: "text", text: json(await discord.listChannels(getDiscordAuth(profile), guild_id)) }] }));
+    s.tool("discord_messages", "Read messages from a Discord channel.", { channel_id: z.string(), limit: z.number().optional(), ...profileParam },
+        async ({ channel_id, limit, profile }) => ({ content: [{ type: "text", text: json(await discord.readMessages(getDiscordAuth(profile), channel_id, limit || 50)) }] }));
+    s.tool("discord_send", "Send a message to a Discord channel.", { channel_id: z.string(), content: z.string(), ...profileParam },
+        async ({ channel_id, content, profile }) => ({ content: [{ type: "text", text: json(await discord.sendMessage(getDiscordAuth(profile), channel_id, content)) }] }));
+    s.tool("discord_channel", "Get Discord channel info.", { channel_id: z.string(), ...profileParam },
+        async ({ channel_id, profile }) => ({ content: [{ type: "text", text: json(await discord.getChannel(getDiscordAuth(profile), channel_id)) }] }));
+    s.tool("discord_search", "Search messages in a Discord server.", { guild_id: z.string(), query: z.string(), limit: z.number().optional(), ...profileParam },
+        async ({ guild_id, query, limit, profile }) => ({ content: [{ type: "text", text: json(await discord.searchMessages(getDiscordAuth(profile), guild_id, query, limit || 25)) }] }));
+    s.tool("discord_dms", "List your Discord DM channels.", { ...profileParam },
+        async ({ profile }) => ({ content: [{ type: "text", text: json(await discord.listDMs(getDiscordAuth(profile))) }] }));
+    s.tool("discord_read_dm", "Read DM messages.", { channel_id: z.string(), limit: z.number().optional(), ...profileParam },
+        async ({ channel_id, limit, profile }) => ({ content: [{ type: "text", text: json(await discord.readDMs(getDiscordAuth(profile), channel_id, limit || 50)) }] }));
+    s.tool("discord_send_dm", "Send a DM to a user.", { user_id: z.string(), content: z.string(), ...profileParam },
+        async ({ user_id, content, profile }) => ({ content: [{ type: "text", text: json(await discord.sendDM(getDiscordAuth(profile), user_id, content)) }] }));
+    s.tool("discord_react", "Add a reaction.", { channel_id: z.string(), message_id: z.string(), emoji: z.string(), ...profileParam },
+        async ({ channel_id, message_id, emoji, profile }) => { await discord.addReaction(getDiscordAuth(profile), channel_id, message_id, emoji); return { content: [{ type: "text", text: "Reaction added." }] }; });
+    s.tool("discord_unreact", "Remove a reaction.", { channel_id: z.string(), message_id: z.string(), emoji: z.string(), ...profileParam },
+        async ({ channel_id, message_id, emoji, profile }) => { await discord.removeReaction(getDiscordAuth(profile), channel_id, message_id, emoji); return { content: [{ type: "text", text: "Reaction removed." }] }; });
+    s.tool("discord_members", "List server members.", { guild_id: z.string(), limit: z.number().optional(), ...profileParam },
+        async ({ guild_id, limit, profile }) => ({ content: [{ type: "text", text: json(await discord.getGuildMembers(getDiscordAuth(profile), guild_id, limit || 100)) }] }));
+    s.tool("discord_user", "Get a Discord user's profile.", { user_id: z.string(), ...profileParam },
+        async ({ user_id, profile }) => ({ content: [{ type: "text", text: json(await discord.getUserProfile(getDiscordAuth(profile), user_id)) }] }));
 
     // Slack
     s.tool("slack_channels", "List Slack channels.", { ...profileParam },
