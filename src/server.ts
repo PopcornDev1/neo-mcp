@@ -18,14 +18,18 @@ import express from "express";
 import { randomUUID } from "node:crypto";
 import * as linkedin from "./integrations/linkedin.js";
 import * as twitter from "./integrations/twitter.js";
+import * as slack from "./integrations/slack.js";
+import * as gmail from "./integrations/gmail.js";
 import * as db from "./db.js";
 import { browserCommand, startBridge, isBridgeConnected } from "./bridge.js";
 
-const NEO_INSTRUCTIONS = `Neo is a browser bridge that lets you operate the user's real accounts — LinkedIn, Twitter/X, WhatsApp, and ANY website they're logged into. No API keys needed.
+const NEO_INSTRUCTIONS = `Neo is a browser bridge that lets you operate the user's real accounts — LinkedIn, Twitter/X, Slack, WhatsApp, and ANY website they're logged into. No API keys needed.
 
 ## Built-in services
 - LinkedIn: extract_auth("linkedin") once, then use linkedin_* tools
 - Twitter/X: extract_auth("twitter") once, then use twitter_* tools
+- Slack: extract_auth("slack") once, then use slack_* tools
+- Gmail: gmail_connect (OAuth sign-in, supports multiple accounts via profile param)
 - WhatsApp: whatsapp_connect (QR code first time, auto-reconnects after)
 
 ## When a built-in tool doesn't exist for what the user wants
@@ -114,6 +118,21 @@ function getTwitterAuth(profile?: string): twitter.TwitterAuth {
     return { auth_token: creds.auth_token, csrf_token: creds.csrf_token || "" };
 }
 
+async function getGmailAuth(profile?: string): Promise<gmail.GmailAuth> {
+    const creds = getAuth(profileKey("gmail", profile));
+    if (!creds.refresh_token) throw new Error(`Gmail not connected${profile ? ` for profile "${profile}"` : ""}. Use gmail_connect to authenticate.`);
+    const access_token = await gmail.refreshAccessToken(creds.refresh_token, profile || "default");
+    return { access_token };
+}
+
+function getSlackAuth(profile?: string): slack.SlackAuth {
+    const creds = getAuth(profileKey("slack", profile));
+    const token = creds.xoxc_token || creds.token || creds.xoxc || creds.xoxp || creds.xoxb;
+    if (!token) throw new Error(`Missing Slack token (have keys: ${Object.keys(creds).join(", ")}). Run extract_auth for slack${profile ? ` (profile: ${profile})` : ""}.`);
+    // Prefer full cookie jar, fall back to just the d cookie
+    return { token, cookie: creds._cookies || (creds.d_cookie ? `d=${creds.d_cookie}` : undefined) };
+}
+
 
 // ── Auth Extraction ──────────────────────────────────────────────────────────
 
@@ -133,9 +152,15 @@ server.tool(
         // Store extracted tokens in db + in-memory fallback
         const creds: Record<string, string> = {};
         for (const [key, value] of Object.entries(result)) {
-            if (key === "service" || key === "cookies" || !value || typeof value !== "string") continue;
+            if (key === "service" || !value || typeof value !== "string") continue;
             creds[key] = value as string;
             try { db.storeCredential(storageKey, key, value as string); } catch {}
+        }
+        // Store full cookie jar as a cookie header string
+        if (Array.isArray(result.cookies) && result.cookies.length > 0) {
+            const cookieHeader = result.cookies.map((c: any) => `${c.name}=${c.value}`).join("; ");
+            creds._cookies = cookieHeader;
+            try { db.storeCredential(storageKey, "_cookies", cookieHeader); } catch {}
         }
         storeAuthInMemory(storageKey, creds);
         const label = profile ? ` as profile "${profile}"` : "";
@@ -543,57 +568,297 @@ server.tool(
     }
 );
 
+// ── Slack ─────────────────────────────────────────────────────────────────────
+
+server.tool("slack_channels", "List Slack channels.", { ...profileParam },
+    async ({ profile }) => ({ content: [{ type: "text", text: json(await slack.listChannels(getSlackAuth(profile))) }] }));
+
+server.tool("slack_channel_info", "Get details about a Slack channel.", { channel: z.string().describe("Channel name or ID"), ...profileParam },
+    async ({ channel, profile }) => ({ content: [{ type: "text", text: json(await slack.getChannelInfo(getSlackAuth(profile), channel)) }] }));
+
+server.tool("slack_read", "Read messages from a Slack channel.", { channel: z.string(), limit: z.number().optional(), oldest: z.number().optional().describe("Unix timestamp ms — only messages after this"), latest: z.number().optional().describe("Unix timestamp ms — only messages before this"), ...profileParam },
+    async ({ channel, limit, oldest, latest, profile }) => ({ content: [{ type: "text", text: json(await slack.readMessages(getSlackAuth(profile), channel, { limit: limit || 50, oldest, latest })) }] }));
+
+server.tool("slack_thread", "Read a Slack thread.", { channel: z.string(), thread_ts: z.string().describe("Thread timestamp ID"), limit: z.number().optional(), ...profileParam },
+    async ({ channel, thread_ts, limit, profile }) => ({ content: [{ type: "text", text: json(await slack.readThread(getSlackAuth(profile), channel, thread_ts, limit || 50)) }] }));
+
+server.tool("slack_dms", "Read recent DMs.", { limit: z.number().optional(), ...profileParam },
+    async ({ limit, profile }) => ({ content: [{ type: "text", text: json(await slack.readDMs(getSlackAuth(profile), limit || 20)) }] }));
+
+server.tool("slack_search", "Search Slack messages.", { query: z.string(), limit: z.number().optional(), sort: z.enum(["score", "timestamp"]).optional(), ...profileParam },
+    async ({ query, limit, sort, profile }) => ({ content: [{ type: "text", text: json(await slack.searchMessages(getSlackAuth(profile), query, { limit: limit || 20, sort })) }] }));
+
+server.tool("slack_send", "Send a message to a Slack channel or DM.", { channel: z.string(), text: z.string(), thread_ts: z.string().optional().describe("Reply in thread"), ...profileParam },
+    async ({ channel, text, thread_ts, profile }) => { const ts = await slack.postMessage(getSlackAuth(profile), channel, text, thread_ts); return { content: [{ type: "text", text: `Sent (ts: ${ts}).` }] }; });
+
+server.tool("slack_react", "Add a reaction emoji to a message.", { channel: z.string(), timestamp: z.string(), emoji: z.string().describe("Emoji name without colons"), ...profileParam },
+    async ({ channel, timestamp, emoji, profile }) => { await slack.addReaction(getSlackAuth(profile), channel, timestamp, emoji); return { content: [{ type: "text", text: "Reacted." }] }; });
+
+server.tool("slack_unreact", "Remove a reaction from a message.", { channel: z.string(), timestamp: z.string(), emoji: z.string(), ...profileParam },
+    async ({ channel, timestamp, emoji, profile }) => { await slack.removeReaction(getSlackAuth(profile), channel, timestamp, emoji); return { content: [{ type: "text", text: "Reaction removed." }] }; });
+
+server.tool("slack_edit", "Edit a Slack message.", { channel: z.string(), timestamp: z.string(), text: z.string(), ...profileParam },
+    async ({ channel, timestamp, text, profile }) => { await slack.updateMessage(getSlackAuth(profile), channel, timestamp, text); return { content: [{ type: "text", text: "Message updated." }] }; });
+
+server.tool("slack_delete", "Delete a Slack message.", { channel: z.string(), timestamp: z.string(), ...profileParam },
+    async ({ channel, timestamp, profile }) => { await slack.deleteMessage(getSlackAuth(profile), channel, timestamp); return { content: [{ type: "text", text: "Deleted." }] }; });
+
+server.tool("slack_users", "List Slack workspace users.", { ...profileParam },
+    async ({ profile }) => ({ content: [{ type: "text", text: json(await slack.listUsers(getSlackAuth(profile))) }] }));
+
+server.tool("slack_user_profile", "Get a Slack user's profile.", { user_id: z.string(), ...profileParam },
+    async ({ user_id, profile }) => ({ content: [{ type: "text", text: json(await slack.getUserProfile(getSlackAuth(profile), user_id)) }] }));
+
+server.tool("slack_set_status", "Set your Slack status.", { text: z.string(), emoji: z.string().optional().describe("Status emoji e.g. :house_with_garden:"), expiration: z.number().optional().describe("Unix timestamp when status expires"), ...profileParam },
+    async ({ text, emoji, expiration, profile }) => { await slack.setStatus(getSlackAuth(profile), text, emoji, expiration); return { content: [{ type: "text", text: "Status set." }] }; });
+
+server.tool("slack_create_channel", "Create a Slack channel.", { name: z.string(), is_private: z.boolean().optional(), ...profileParam },
+    async ({ name, is_private, profile }) => ({ content: [{ type: "text", text: json(await slack.createChannel(getSlackAuth(profile), name, is_private)) }] }));
+
+server.tool("slack_archive_channel", "Archive a Slack channel.", { channel: z.string(), ...profileParam },
+    async ({ channel, profile }) => { await slack.archiveChannel(getSlackAuth(profile), channel); return { content: [{ type: "text", text: "Archived." }] }; });
+
+server.tool("slack_invite", "Invite users to a channel.", { channel: z.string(), user_ids: z.array(z.string()), ...profileParam },
+    async ({ channel, user_ids, profile }) => { await slack.inviteToChannel(getSlackAuth(profile), channel, user_ids); return { content: [{ type: "text", text: "Invited." }] }; });
+
+server.tool("slack_kick", "Remove a user from a channel.", { channel: z.string(), user_id: z.string(), ...profileParam },
+    async ({ channel, user_id, profile }) => { await slack.kickFromChannel(getSlackAuth(profile), channel, user_id); return { content: [{ type: "text", text: "Removed." }] }; });
+
+server.tool("slack_set_topic", "Set a channel's topic.", { channel: z.string(), topic: z.string(), ...profileParam },
+    async ({ channel, topic, profile }) => { await slack.setChannelTopic(getSlackAuth(profile), channel, topic); return { content: [{ type: "text", text: "Topic set." }] }; });
+
+server.tool("slack_set_purpose", "Set a channel's purpose.", { channel: z.string(), purpose: z.string(), ...profileParam },
+    async ({ channel, purpose, profile }) => { await slack.setChannelPurpose(getSlackAuth(profile), channel, purpose); return { content: [{ type: "text", text: "Purpose set." }] }; });
+
+server.tool("slack_pin", "Pin a message.", { channel: z.string(), timestamp: z.string(), ...profileParam },
+    async ({ channel, timestamp, profile }) => { await slack.pinMessage(getSlackAuth(profile), channel, timestamp); return { content: [{ type: "text", text: "Pinned." }] }; });
+
+server.tool("slack_unpin", "Unpin a message.", { channel: z.string(), timestamp: z.string(), ...profileParam },
+    async ({ channel, timestamp, profile }) => { await slack.unpinMessage(getSlackAuth(profile), channel, timestamp); return { content: [{ type: "text", text: "Unpinned." }] }; });
+
+server.tool("slack_pins", "List pinned messages in a channel.", { channel: z.string(), ...profileParam },
+    async ({ channel, profile }) => ({ content: [{ type: "text", text: json(await slack.listPins(getSlackAuth(profile), channel)) }] }));
+
+// ── Gmail ─────────────────────────────────────────────────────────────────────
+
+server.tool("gmail_connect", "Connect a Gmail account via OAuth. Opens Google sign-in in the browser. Use profile to connect multiple accounts.",
+    { profile: z.string().optional().describe("Account name (e.g. 'personal', 'work'). Omit for default.") },
+    async ({ profile }) => {
+        const authUrl = `http://127.0.0.1:${httpPort}/gmail/auth${profile ? `?profile=${profile}` : ""}`;
+        try { await browserCommand("navigate", { url: authUrl }); } catch {}
+        // Wait for callback to store tokens
+        const storageKey = profileKey("gmail", profile);
+        const deadline = Date.now() + 120000;
+        while (Date.now() < deadline) {
+            await new Promise(r => setTimeout(r, 2000));
+            const creds = memCredentials.get(storageKey);
+            if (creds?.refresh_token) {
+                const label = profile ? ` as "${profile}"` : "";
+                return { content: [{ type: "text", text: `Gmail connected${label}${creds.email ? ` (${creds.email})` : ""}.` }] };
+            }
+        }
+        return { content: [{ type: "text", text: `Timed out waiting for Gmail auth. Visit ${authUrl} manually.` }] };
+    });
+
+server.tool("gmail_profile", "Get Gmail profile info (email, message count).", { ...profileParam },
+    async ({ profile }) => ({ content: [{ type: "text", text: json(await gmail.getProfile(await getGmailAuth(profile))) }] }));
+
+server.tool("gmail_inbox", "Read your Gmail inbox.", { query: z.string().optional().describe("Gmail search query to filter"), max_results: z.number().optional(), page_token: z.string().optional(), ...profileParam },
+    async ({ query, max_results, page_token, profile }) => ({ content: [{ type: "text", text: json(await gmail.getInbox(await getGmailAuth(profile), { query, maxResults: max_results || 20, pageToken: page_token })) }] }));
+
+server.tool("gmail_search", "Search Gmail messages.", { query: z.string().describe("Gmail search query (same syntax as Gmail search bar)"), max_results: z.number().optional(), page_token: z.string().optional(), ...profileParam },
+    async ({ query, max_results, page_token, profile }) => ({ content: [{ type: "text", text: json(await gmail.searchMail(await getGmailAuth(profile), query, max_results || 20, page_token)) }] }));
+
+server.tool("gmail_read", "Read a specific email message.", { message_id: z.string(), ...profileParam },
+    async ({ message_id, profile }) => ({ content: [{ type: "text", text: json(await gmail.getMessage(await getGmailAuth(profile), message_id)) }] }));
+
+server.tool("gmail_thread", "Read an entire email thread.", { thread_id: z.string(), ...profileParam },
+    async ({ thread_id, profile }) => ({ content: [{ type: "text", text: json(await gmail.getThread(await getGmailAuth(profile), thread_id)) }] }));
+
+server.tool("gmail_send", "Send an email.", { to: z.string(), subject: z.string(), body: z.string(), cc: z.string().optional(), bcc: z.string().optional(), thread_id: z.string().optional().describe("Thread ID to reply in"), ...profileParam },
+    async ({ to, subject, body, cc, bcc, thread_id, profile }) => ({ content: [{ type: "text", text: json(await gmail.sendEmail(await getGmailAuth(profile), to, subject, body, { cc, bcc, threadId: thread_id })) }] }));
+
+server.tool("gmail_reply", "Reply to the last message in a thread.", { thread_id: z.string(), body: z.string(), ...profileParam },
+    async ({ thread_id, body, profile }) => ({ content: [{ type: "text", text: json(await gmail.replyToThread(await getGmailAuth(profile), thread_id, body)) }] }));
+
+server.tool("gmail_draft", "Create a draft email.", { to: z.string(), subject: z.string(), body: z.string(), cc: z.string().optional(), bcc: z.string().optional(), thread_id: z.string().optional(), ...profileParam },
+    async ({ to, subject, body, cc, bcc, thread_id, profile }) => ({ content: [{ type: "text", text: json(await gmail.createDraft(await getGmailAuth(profile), to, subject, body, { cc, bcc, threadId: thread_id })) }] }));
+
+server.tool("gmail_mark_read", "Mark an email as read.", { message_id: z.string(), ...profileParam },
+    async ({ message_id, profile }) => { await gmail.markAsRead(await getGmailAuth(profile), message_id); return { content: [{ type: "text", text: "Marked as read." }] }; });
+
+server.tool("gmail_archive", "Archive an email (remove from inbox).", { message_id: z.string(), ...profileParam },
+    async ({ message_id, profile }) => { await gmail.archiveMessage(await getGmailAuth(profile), message_id); return { content: [{ type: "text", text: "Archived." }] }; });
+
+server.tool("gmail_trash", "Move an email to trash.", { message_id: z.string(), ...profileParam },
+    async ({ message_id, profile }) => { await gmail.trashMessage(await getGmailAuth(profile), message_id); return { content: [{ type: "text", text: "Trashed." }] }; });
+
+server.tool("gmail_star", "Star an email.", { message_id: z.string(), ...profileParam },
+    async ({ message_id, profile }) => { await gmail.starMessage(await getGmailAuth(profile), message_id); return { content: [{ type: "text", text: "Starred." }] }; });
+
+server.tool("gmail_labels", "List all Gmail labels.", { ...profileParam },
+    async ({ profile }) => ({ content: [{ type: "text", text: json(await gmail.listLabels(await getGmailAuth(profile))) }] }));
+
+server.tool("gmail_label_create", "Create a Gmail label.", { name: z.string(), ...profileParam },
+    async ({ name, profile }) => ({ content: [{ type: "text", text: json(await gmail.createLabel(await getGmailAuth(profile), name)) }] }));
+
+server.tool("gmail_modify", "Add or remove labels from a message.", { message_id: z.string(), add_labels: z.array(z.string()).optional(), remove_labels: z.array(z.string()).optional(), ...profileParam },
+    async ({ message_id, add_labels, remove_labels, profile }) => { await gmail.modifyMessage(await getGmailAuth(profile), message_id, add_labels || [], remove_labels || []); return { content: [{ type: "text", text: "Labels modified." }] }; });
+
 // ── WhatsApp ─────────────────────────────────────────────────────────────────
 
 server.tool(
     "whatsapp_connect",
-    "Connect to WhatsApp. Returns a QR code to scan on first use. Auto-reconnects after that.",
+    "Connect to WhatsApp. Opens a QR code in the browser on first use. Auto-reconnects after that.",
     {},
     async () => {
         const wa = await import("./integrations/whatsapp.js");
-        await wa.connect();
-        return { content: [{ type: "text", text: "WhatsApp connected." }] };
+        const { state } = wa.getConnectionState();
+        if (state === "connected") return { content: [{ type: "text", text: "WhatsApp already connected." }] };
+
+        wa.connect().catch(() => {});
+
+        const deadline = Date.now() + 10000;
+        while (Date.now() < deadline) {
+            const s = wa.getConnectionState();
+            if (s.state === "connected") return { content: [{ type: "text", text: "WhatsApp connected." }] };
+            if (s.state === "qr" && s.qr) {
+                const qrUrl = `http://127.0.0.1:${httpPort}/whatsapp-qr`;
+                try { await browserCommand("navigate", { url: qrUrl }); } catch {}
+                const scanDeadline = Date.now() + 60000;
+                while (Date.now() < scanDeadline) {
+                    await new Promise(r => setTimeout(r, 2000));
+                    if (wa.getConnectionState().state === "connected") {
+                        return { content: [{ type: "text", text: "WhatsApp connected! QR code scanned successfully." }] };
+                    }
+                }
+                return { content: [{ type: "text", text: `QR code opened in browser at ${qrUrl}. Scan it with WhatsApp (Linked Devices > Link a Device), then call whatsapp_connect again.` }] };
+            }
+            await new Promise(r => setTimeout(r, 500));
+        }
+        return { content: [{ type: "text", text: `WhatsApp connection state: ${wa.getConnectionState().state}. Try again.` }] };
     }
 );
 
-server.tool(
-    "whatsapp_chats",
-    "List WhatsApp chats with last message and unread count.",
-    { limit: z.number().optional() },
-    async ({ limit }) => {
-        const wa = await import("./integrations/whatsapp.js");
-        const chats = await wa.getChats(limit || 30);
-        return { content: [{ type: "text", text: json(chats) }] };
-    }
-);
+server.tool("whatsapp_chats", "List WhatsApp chats with last message and unread count.", { limit: z.number().optional() },
+    async ({ limit }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.getChats(limit || 30)) }] }; });
 
-server.tool(
-    "whatsapp_read",
-    "Read messages from a WhatsApp chat. Pass chat ID, phone number, or contact name.",
-    {
-        chat: z.string().describe("Chat ID, phone number (e.g. +919876543210), or contact name"),
-        limit: z.number().optional(),
-    },
-    async ({ chat, limit }) => {
-        const wa = await import("./integrations/whatsapp.js");
-        const messages = await wa.readMessages(chat, limit || 30);
-        return { content: [{ type: "text", text: json(messages) }] };
-    }
-);
+server.tool("whatsapp_search_chats", "Search WhatsApp chats by name.", { query: z.string(), limit: z.number().optional() },
+    async ({ query, limit }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.searchChats(query, limit || 20)) }] }; });
 
-server.tool(
-    "whatsapp_send",
-    "Send a WhatsApp message.",
-    {
-        to: z.string().describe("Phone number, contact name, or chat ID"),
-        text: z.string(),
-    },
-    async ({ to, text }) => {
-        const wa = await import("./integrations/whatsapp.js");
-        const result = await wa.sendMessage(to, text);
-        return { content: [{ type: "text", text: json(result) }] };
-    }
-);
+server.tool("whatsapp_read", "Read messages from a WhatsApp chat with pagination and search.",
+    { chat: z.string().describe("Chat ID, phone number, or contact name"), limit: z.number().optional(), offset: z.number().optional().describe("Skip N most recent messages"), query: z.string().optional().describe("Filter messages containing this text"), before: z.number().optional().describe("Unix timestamp cursor — only messages before this time") },
+    async ({ chat, limit, offset, query, before }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.readMessages(chat, { limit: limit || 30, offset, query, before })) }] }; });
+
+server.tool("whatsapp_search", "Search messages across all WhatsApp chats by text content.",
+    { query: z.string(), chat: z.string().optional().describe("Limit search to a specific chat"), limit: z.number().optional() },
+    async ({ query, chat, limit }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.searchMessages(query, { chatId: chat, limit: limit || 30 })) }] }; });
+
+server.tool("whatsapp_send", "Send a WhatsApp text message.", { to: z.string().describe("Phone number, contact name, or chat ID"), text: z.string() },
+    async ({ to, text }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.sendMessage(to, text)) }] }; });
+
+server.tool("whatsapp_send_media", "Send media (image, video, document, audio, sticker) on WhatsApp.",
+    { to: z.string(), type: z.enum(["image", "video", "document", "audio", "sticker"]), url: z.string().describe("File URL or local path"), caption: z.string().optional(), filename: z.string().optional(), mimetype: z.string().optional() },
+    async ({ to, type, url, caption, filename, mimetype }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.sendMedia(to, { type, url, caption, filename, mimetype })) }] }; });
+
+server.tool("whatsapp_send_location", "Send a location on WhatsApp.", { to: z.string(), latitude: z.number(), longitude: z.number(), name: z.string().optional() },
+    async ({ to, latitude, longitude, name }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.sendLocation(to, latitude, longitude, name)) }] }; });
+
+server.tool("whatsapp_send_contact", "Send a contact card on WhatsApp.", { to: z.string(), contact_name: z.string(), contact_phone: z.string().describe("Phone number without + prefix") },
+    async ({ to, contact_name, contact_phone }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.sendContact(to, contact_name, contact_phone)) }] }; });
+
+// WhatsApp Contacts & Profile
+server.tool("whatsapp_check_number", "Check if a phone number is on WhatsApp.", { phone: z.string() },
+    async ({ phone }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.checkOnWhatsApp(phone)) }] }; });
+
+server.tool("whatsapp_find_contact", "Search contacts by name or phone number.", { query: z.string() },
+    async ({ query }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.findContact(query)) }] }; });
+
+server.tool("whatsapp_profile_pic", "Get profile picture URL for a contact or group.", { chat: z.string() },
+    async ({ chat }) => { const wa = await import("./integrations/whatsapp.js"); const url = await wa.getProfilePicUrl(chat); return { content: [{ type: "text", text: url || "No profile picture." }] }; });
+
+server.tool("whatsapp_status", "Get a contact's status/bio.", { chat: z.string() },
+    async ({ chat }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.getStatus(chat)) }] }; });
+
+server.tool("whatsapp_update_status", "Update your WhatsApp status/bio.", { status: z.string() },
+    async ({ status }) => { const wa = await import("./integrations/whatsapp.js"); await wa.updateMyStatus(status); return { content: [{ type: "text", text: "Status updated." }] }; });
+
+server.tool("whatsapp_presence", "Send presence update (typing indicator, online, etc.).",
+    { type: z.enum(["available", "unavailable", "composing", "paused", "recording"]), chat: z.string().optional().describe("Chat to show typing in") },
+    async ({ type, chat }) => { const wa = await import("./integrations/whatsapp.js"); await wa.sendPresence(type, chat); return { content: [{ type: "text", text: `Presence set to ${type}.` }] }; });
+
+server.tool("whatsapp_add_contact", "Create or update a contact.", { phone: z.string(), name: z.string() },
+    async ({ phone, name }) => { const wa = await import("./integrations/whatsapp.js"); await wa.addOrEditContact(phone, name); return { content: [{ type: "text", text: `Contact ${name} saved.` }] }; });
+
+// WhatsApp Chat Management
+server.tool("whatsapp_chat_modify", "Archive, unarchive, mute, unmute, pin, or unpin a chat.",
+    { chat: z.string(), action: z.enum(["archive", "unarchive", "mute", "unmute", "pin", "unpin"]) },
+    async ({ chat, action }) => { const wa = await import("./integrations/whatsapp.js"); await wa.modifyChat(chat, action); return { content: [{ type: "text", text: `Chat ${action}d.` }] }; });
+
+server.tool("whatsapp_star", "Star or unstar messages.", { chat: z.string(), message_ids: z.array(z.string()), star: z.boolean() },
+    async ({ chat, message_ids, star }) => { const wa = await import("./integrations/whatsapp.js"); await wa.starMessages(chat, message_ids, star); return { content: [{ type: "text", text: star ? "Messages starred." : "Messages unstarred." }] }; });
+
+server.tool("whatsapp_mark_read", "Mark a chat as read.", { chat: z.string() },
+    async ({ chat }) => { const wa = await import("./integrations/whatsapp.js"); await wa.markRead(chat); return { content: [{ type: "text", text: "Marked as read." }] }; });
+
+// WhatsApp Privacy
+server.tool("whatsapp_block", "Block a contact.", { chat: z.string() },
+    async ({ chat }) => { const wa = await import("./integrations/whatsapp.js"); await wa.blockContact(chat); return { content: [{ type: "text", text: "Blocked." }] }; });
+
+server.tool("whatsapp_unblock", "Unblock a contact.", { chat: z.string() },
+    async ({ chat }) => { const wa = await import("./integrations/whatsapp.js"); await wa.unblockContact(chat); return { content: [{ type: "text", text: "Unblocked." }] }; });
+
+server.tool("whatsapp_blocklist", "List all blocked contacts.", {},
+    async () => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.getBlocklist()) }] }; });
+
+// WhatsApp Groups
+server.tool("whatsapp_group_info", "Get group metadata (members, description, settings).", { group: z.string() },
+    async ({ group }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.getGroupMetadata(group)) }] }; });
+
+server.tool("whatsapp_group_create", "Create a new WhatsApp group.", { name: z.string(), participants: z.array(z.string()).describe("Phone numbers or JIDs") },
+    async ({ name, participants }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.createGroup(name, participants)) }] }; });
+
+server.tool("whatsapp_group_participants", "Add, remove, promote, or demote group members.",
+    { group: z.string(), participants: z.array(z.string()), action: z.enum(["add", "remove", "promote", "demote"]) },
+    async ({ group, participants, action }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.updateGroupParticipants(group, participants, action)) }] }; });
+
+server.tool("whatsapp_group_update_name", "Change a group's name.", { group: z.string(), name: z.string() },
+    async ({ group, name }) => { const wa = await import("./integrations/whatsapp.js"); await wa.updateGroupSubject(group, name); return { content: [{ type: "text", text: "Group name updated." }] }; });
+
+server.tool("whatsapp_group_update_description", "Change a group's description.", { group: z.string(), description: z.string() },
+    async ({ group, description }) => { const wa = await import("./integrations/whatsapp.js"); await wa.updateGroupDescription(group, description); return { content: [{ type: "text", text: "Group description updated." }] }; });
+
+server.tool("whatsapp_groups_list", "List all groups you're participating in.", {},
+    async () => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.getAllGroups()) }] }; });
+
+server.tool("whatsapp_group_invite", "Get the invite link for a group.", { group: z.string() },
+    async ({ group }) => { const wa = await import("./integrations/whatsapp.js"); const code = await wa.getGroupInviteCode(group); return { content: [{ type: "text", text: `https://chat.whatsapp.com/${code}` }] }; });
+
+server.tool("whatsapp_group_leave", "Leave a WhatsApp group.", { group: z.string() },
+    async ({ group }) => { const wa = await import("./integrations/whatsapp.js"); await wa.leaveGroup(group); return { content: [{ type: "text", text: "Left group." }] }; });
+
+// WhatsApp Newsletters/Channels
+server.tool("whatsapp_newsletter_create", "Create a new WhatsApp channel.", { name: z.string(), description: z.string().optional() },
+    async ({ name, description }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.createNewsletter(name, description)) }] }; });
+
+server.tool("whatsapp_newsletter_follow", "Follow a WhatsApp channel.", { jid: z.string() },
+    async ({ jid }) => { const wa = await import("./integrations/whatsapp.js"); await wa.followNewsletter(jid); return { content: [{ type: "text", text: "Followed." }] }; });
+
+server.tool("whatsapp_newsletter_unfollow", "Unfollow a WhatsApp channel.", { jid: z.string() },
+    async ({ jid }) => { const wa = await import("./integrations/whatsapp.js"); await wa.unfollowNewsletter(jid); return { content: [{ type: "text", text: "Unfollowed." }] }; });
+
+server.tool("whatsapp_newsletter_messages", "Get messages from a WhatsApp channel.", { jid: z.string(), count: z.number().optional() },
+    async ({ jid, count }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.getNewsletterMessages(jid, count || 20)) }] }; });
+
+server.tool("whatsapp_newsletter_info", "Get info about a WhatsApp channel.", { jid: z.string() },
+    async ({ jid }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.getNewsletterMetadata(jid)) }] }; });
+
+// WhatsApp Business
+server.tool("whatsapp_business_profile", "Get a business profile.", { chat: z.string() },
+    async ({ chat }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.getBusinessProfile(chat)) }] }; });
+
+server.tool("whatsapp_catalog", "Get a business's product catalog.", { chat: z.string(), limit: z.number().optional() },
+    async ({ chat, limit }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.getCatalog(chat, limit || 50)) }] }; });
 
 // ── Credential Management ────────────────────────────────────────────────────
 
@@ -1041,6 +1306,59 @@ async function main() {
         res.status(200).end();
     });
 
+    // ── Gmail OAuth ──────────────────────────────────────────────────────
+    app.get("/gmail/auth", (req: any, res: any) => {
+        const profile = req.query.profile || undefined;
+        const redirectUri = `http://localhost:${httpPort}/gmail/callback`;
+        const url = gmail.getOAuthUrl(redirectUri, profile);
+        res.redirect(url);
+    });
+
+    app.get("/gmail/callback", async (req: any, res: any) => {
+        const code = req.query.code as string;
+        const profile = (req.query.state as string) || "default";
+        if (!code) { res.status(400).send("Missing authorization code."); return; }
+        try {
+            const redirectUri = `http://localhost:${httpPort}/gmail/callback`;
+            const tokens = await gmail.exchangeCode(code, redirectUri);
+            const storageKey = profileKey("gmail", profile === "default" ? undefined : profile);
+            const creds: Record<string, string> = { refresh_token: tokens.refresh_token };
+            try { db.storeCredential(storageKey, "refresh_token", tokens.refresh_token); } catch {}
+            storeAuthInMemory(storageKey, creds);
+            // Get the email address for confirmation
+            let email = "";
+            try {
+                const auth = { access_token: tokens.access_token };
+                const p = await gmail.getProfile(auth);
+                email = p.email;
+                try { db.storeCredential(storageKey, "email", email); } catch {}
+                storeAuthInMemory(storageKey, { ...creds, email });
+            } catch {}
+            const label = profile !== "default" ? ` (profile: ${profile})` : "";
+            res.send(`<html><body style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:system-ui;background:#111;color:#fff"><div style="text-align:center"><h1>Gmail Connected &#x2705;</h1><p style="color:#aaa">${email}${label}</p><p style="color:#666">You can close this tab.</p></div></body></html>`);
+        } catch (err: any) {
+            res.status(500).send(`<html><body style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:system-ui;background:#111;color:#fff"><div style="text-align:center"><h1>Auth Failed</h1><p style="color:#f66">${err.message}</p></div></body></html>`);
+        }
+    });
+
+    // ── WhatsApp QR page ──────────────────────────────────────────────────
+    app.get("/whatsapp-qr", async (req, res) => {
+        const wa = await import("./integrations/whatsapp.js");
+        const { state, qr } = wa.getConnectionState();
+        const QRCode = (await import("qrcode")).default;
+        let body: string;
+        if (state === "connected") {
+            body = `<html><body style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:system-ui;background:#111;color:#fff"><h1>WhatsApp Connected &#x2705;</h1></body></html>`;
+        } else if (qr) {
+            const dataUrl = await QRCode.toDataURL(qr, { margin: 2, scale: 8, width: 300 });
+            body = `<html><head><meta http-equiv="refresh" content="5"></head><body style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:system-ui;background:#111;color:#fff"><h2>Scan with WhatsApp</h2><p style="color:#aaa">Linked Devices &rarr; Link a Device</p><div style="background:white;padding:24px;border-radius:16px"><img src="${dataUrl}" width="300" height="300" style="display:block"></div><p style="color:#666;margin-top:16px">Auto-refreshing every 5s...</p></body></html>`;
+        } else {
+            body = `<html><head><meta http-equiv="refresh" content="3"></head><body style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:system-ui;background:#111;color:#fff"><h2>Connecting to WhatsApp... waiting for QR code</h2></body></html>`;
+        }
+        res.setHeader("Content-Type", "text/html");
+        res.send(body);
+    });
+
     app.listen(httpPort, "127.0.0.1", () => {
         console.error(`[neo-mcp] HTTP transport listening on http://127.0.0.1:${httpPort}/mcp`);
     });
@@ -1072,9 +1390,14 @@ function registerAllTools(s: McpServer) {
             const storageKey = profileKey(service, profile);
             const creds: Record<string, string> = {};
             for (const [key, value] of Object.entries(result)) {
-                if (key === "service" || key === "cookies" || !value || typeof value !== "string") continue;
+                if (key === "service" || !value || typeof value !== "string") continue;
                 creds[key] = value as string;
                 try { db.storeCredential(storageKey, key, value as string); } catch {}
+            }
+            if (Array.isArray(result.cookies) && result.cookies.length > 0) {
+                const cookieHeader = result.cookies.map((c: any) => `${c.name}=${c.value}`).join("; ");
+                creds._cookies = cookieHeader;
+                try { db.storeCredential(storageKey, "_cookies", cookieHeader); } catch {}
             }
             storeAuthInMemory(storageKey, creds);
             const label = profile ? ` as profile "${profile}"` : "";
@@ -1183,6 +1506,103 @@ function registerAllTools(s: McpServer) {
     s.tool("twitter_search", "Search tweets.", { query: z.string(), count: z.number().optional(), ...profileParam },
         async ({ query, count, profile }) => ({ content: [{ type: "text", text: json(await twitter.searchTweets(getTwitterAuth(profile), query, count || 20)) }] }));
 
+    // Slack
+    s.tool("slack_channels", "List Slack channels.", { ...profileParam },
+        async ({ profile }) => ({ content: [{ type: "text", text: json(await slack.listChannels(getSlackAuth(profile))) }] }));
+    s.tool("slack_channel_info", "Get details about a Slack channel.", { channel: z.string(), ...profileParam },
+        async ({ channel, profile }) => ({ content: [{ type: "text", text: json(await slack.getChannelInfo(getSlackAuth(profile), channel)) }] }));
+    s.tool("slack_read", "Read messages from a Slack channel.", { channel: z.string(), limit: z.number().optional(), oldest: z.number().optional(), latest: z.number().optional(), ...profileParam },
+        async ({ channel, limit, oldest, latest, profile }) => ({ content: [{ type: "text", text: json(await slack.readMessages(getSlackAuth(profile), channel, { limit: limit || 50, oldest, latest })) }] }));
+    s.tool("slack_thread", "Read a Slack thread.", { channel: z.string(), thread_ts: z.string(), limit: z.number().optional(), ...profileParam },
+        async ({ channel, thread_ts, limit, profile }) => ({ content: [{ type: "text", text: json(await slack.readThread(getSlackAuth(profile), channel, thread_ts, limit || 50)) }] }));
+    s.tool("slack_dms", "Read recent DMs.", { limit: z.number().optional(), ...profileParam },
+        async ({ limit, profile }) => ({ content: [{ type: "text", text: json(await slack.readDMs(getSlackAuth(profile), limit || 20)) }] }));
+    s.tool("slack_search", "Search Slack messages.", { query: z.string(), limit: z.number().optional(), sort: z.enum(["score", "timestamp"]).optional(), ...profileParam },
+        async ({ query, limit, sort, profile }) => ({ content: [{ type: "text", text: json(await slack.searchMessages(getSlackAuth(profile), query, { limit: limit || 20, sort })) }] }));
+    s.tool("slack_send", "Send a message to a Slack channel or DM.", { channel: z.string(), text: z.string(), thread_ts: z.string().optional(), ...profileParam },
+        async ({ channel, text, thread_ts, profile }) => { const ts = await slack.postMessage(getSlackAuth(profile), channel, text, thread_ts); return { content: [{ type: "text", text: `Sent (ts: ${ts}).` }] }; });
+    s.tool("slack_react", "Add a reaction emoji to a message.", { channel: z.string(), timestamp: z.string(), emoji: z.string(), ...profileParam },
+        async ({ channel, timestamp, emoji, profile }) => { await slack.addReaction(getSlackAuth(profile), channel, timestamp, emoji); return { content: [{ type: "text", text: "Reacted." }] }; });
+    s.tool("slack_unreact", "Remove a reaction from a message.", { channel: z.string(), timestamp: z.string(), emoji: z.string(), ...profileParam },
+        async ({ channel, timestamp, emoji, profile }) => { await slack.removeReaction(getSlackAuth(profile), channel, timestamp, emoji); return { content: [{ type: "text", text: "Reaction removed." }] }; });
+    s.tool("slack_edit", "Edit a Slack message.", { channel: z.string(), timestamp: z.string(), text: z.string(), ...profileParam },
+        async ({ channel, timestamp, text, profile }) => { await slack.updateMessage(getSlackAuth(profile), channel, timestamp, text); return { content: [{ type: "text", text: "Message updated." }] }; });
+    s.tool("slack_delete", "Delete a Slack message.", { channel: z.string(), timestamp: z.string(), ...profileParam },
+        async ({ channel, timestamp, profile }) => { await slack.deleteMessage(getSlackAuth(profile), channel, timestamp); return { content: [{ type: "text", text: "Deleted." }] }; });
+    s.tool("slack_users", "List Slack workspace users.", { ...profileParam },
+        async ({ profile }) => ({ content: [{ type: "text", text: json(await slack.listUsers(getSlackAuth(profile))) }] }));
+    s.tool("slack_user_profile", "Get a Slack user's profile.", { user_id: z.string(), ...profileParam },
+        async ({ user_id, profile }) => ({ content: [{ type: "text", text: json(await slack.getUserProfile(getSlackAuth(profile), user_id)) }] }));
+    s.tool("slack_set_status", "Set your Slack status.", { text: z.string(), emoji: z.string().optional(), expiration: z.number().optional(), ...profileParam },
+        async ({ text, emoji, expiration, profile }) => { await slack.setStatus(getSlackAuth(profile), text, emoji, expiration); return { content: [{ type: "text", text: "Status set." }] }; });
+    s.tool("slack_create_channel", "Create a Slack channel.", { name: z.string(), is_private: z.boolean().optional(), ...profileParam },
+        async ({ name, is_private, profile }) => ({ content: [{ type: "text", text: json(await slack.createChannel(getSlackAuth(profile), name, is_private)) }] }));
+    s.tool("slack_archive_channel", "Archive a Slack channel.", { channel: z.string(), ...profileParam },
+        async ({ channel, profile }) => { await slack.archiveChannel(getSlackAuth(profile), channel); return { content: [{ type: "text", text: "Archived." }] }; });
+    s.tool("slack_invite", "Invite users to a channel.", { channel: z.string(), user_ids: z.array(z.string()), ...profileParam },
+        async ({ channel, user_ids, profile }) => { await slack.inviteToChannel(getSlackAuth(profile), channel, user_ids); return { content: [{ type: "text", text: "Invited." }] }; });
+    s.tool("slack_kick", "Remove a user from a channel.", { channel: z.string(), user_id: z.string(), ...profileParam },
+        async ({ channel, user_id, profile }) => { await slack.kickFromChannel(getSlackAuth(profile), channel, user_id); return { content: [{ type: "text", text: "Removed." }] }; });
+    s.tool("slack_set_topic", "Set a channel's topic.", { channel: z.string(), topic: z.string(), ...profileParam },
+        async ({ channel, topic, profile }) => { await slack.setChannelTopic(getSlackAuth(profile), channel, topic); return { content: [{ type: "text", text: "Topic set." }] }; });
+    s.tool("slack_set_purpose", "Set a channel's purpose.", { channel: z.string(), purpose: z.string(), ...profileParam },
+        async ({ channel, purpose, profile }) => { await slack.setChannelPurpose(getSlackAuth(profile), channel, purpose); return { content: [{ type: "text", text: "Purpose set." }] }; });
+    s.tool("slack_pin", "Pin a message.", { channel: z.string(), timestamp: z.string(), ...profileParam },
+        async ({ channel, timestamp, profile }) => { await slack.pinMessage(getSlackAuth(profile), channel, timestamp); return { content: [{ type: "text", text: "Pinned." }] }; });
+    s.tool("slack_unpin", "Unpin a message.", { channel: z.string(), timestamp: z.string(), ...profileParam },
+        async ({ channel, timestamp, profile }) => { await slack.unpinMessage(getSlackAuth(profile), channel, timestamp); return { content: [{ type: "text", text: "Unpinned." }] }; });
+    s.tool("slack_pins", "List pinned messages in a channel.", { channel: z.string(), ...profileParam },
+        async ({ channel, profile }) => ({ content: [{ type: "text", text: json(await slack.listPins(getSlackAuth(profile), channel)) }] }));
+
+    // Gmail
+    s.tool("gmail_connect", "Connect a Gmail account via OAuth. Opens Google sign-in in the browser.",
+        { profile: z.string().optional().describe("Account name (e.g. 'personal', 'work'). Omit for default.") },
+        async ({ profile }) => {
+            const authUrl = `http://127.0.0.1:${httpPort}/gmail/auth${profile ? `?profile=${profile}` : ""}`;
+            try { await browserCommand("navigate", { url: authUrl }); } catch {}
+            const storageKey = profileKey("gmail", profile);
+            const deadline = Date.now() + 120000;
+            while (Date.now() < deadline) {
+                await new Promise(r => setTimeout(r, 2000));
+                const creds = memCredentials.get(storageKey);
+                if (creds?.refresh_token) {
+                    const label = profile ? ` as "${profile}"` : "";
+                    return { content: [{ type: "text", text: `Gmail connected${label}${creds.email ? ` (${creds.email})` : ""}.` }] };
+                }
+            }
+            return { content: [{ type: "text", text: `Timed out. Visit ${authUrl} manually.` }] };
+        });
+    s.tool("gmail_profile", "Get Gmail profile info.", { ...profileParam },
+        async ({ profile }) => ({ content: [{ type: "text", text: json(await gmail.getProfile(await getGmailAuth(profile))) }] }));
+    s.tool("gmail_inbox", "Read your Gmail inbox.", { query: z.string().optional(), max_results: z.number().optional(), page_token: z.string().optional(), ...profileParam },
+        async ({ query, max_results, page_token, profile }) => ({ content: [{ type: "text", text: json(await gmail.getInbox(await getGmailAuth(profile), { query, maxResults: max_results || 20, pageToken: page_token })) }] }));
+    s.tool("gmail_search", "Search Gmail messages.", { query: z.string(), max_results: z.number().optional(), page_token: z.string().optional(), ...profileParam },
+        async ({ query, max_results, page_token, profile }) => ({ content: [{ type: "text", text: json(await gmail.searchMail(await getGmailAuth(profile), query, max_results || 20, page_token)) }] }));
+    s.tool("gmail_read", "Read a specific email.", { message_id: z.string(), ...profileParam },
+        async ({ message_id, profile }) => ({ content: [{ type: "text", text: json(await gmail.getMessage(await getGmailAuth(profile), message_id)) }] }));
+    s.tool("gmail_thread", "Read an entire email thread.", { thread_id: z.string(), ...profileParam },
+        async ({ thread_id, profile }) => ({ content: [{ type: "text", text: json(await gmail.getThread(await getGmailAuth(profile), thread_id)) }] }));
+    s.tool("gmail_send", "Send an email.", { to: z.string(), subject: z.string(), body: z.string(), cc: z.string().optional(), bcc: z.string().optional(), thread_id: z.string().optional(), ...profileParam },
+        async ({ to, subject, body, cc, bcc, thread_id, profile }) => ({ content: [{ type: "text", text: json(await gmail.sendEmail(await getGmailAuth(profile), to, subject, body, { cc, bcc, threadId: thread_id })) }] }));
+    s.tool("gmail_reply", "Reply to the last message in a thread.", { thread_id: z.string(), body: z.string(), ...profileParam },
+        async ({ thread_id, body, profile }) => ({ content: [{ type: "text", text: json(await gmail.replyToThread(await getGmailAuth(profile), thread_id, body)) }] }));
+    s.tool("gmail_draft", "Create a draft email.", { to: z.string(), subject: z.string(), body: z.string(), cc: z.string().optional(), bcc: z.string().optional(), thread_id: z.string().optional(), ...profileParam },
+        async ({ to, subject, body, cc, bcc, thread_id, profile }) => ({ content: [{ type: "text", text: json(await gmail.createDraft(await getGmailAuth(profile), to, subject, body, { cc, bcc, threadId: thread_id })) }] }));
+    s.tool("gmail_mark_read", "Mark an email as read.", { message_id: z.string(), ...profileParam },
+        async ({ message_id, profile }) => { await gmail.markAsRead(await getGmailAuth(profile), message_id); return { content: [{ type: "text", text: "Marked as read." }] }; });
+    s.tool("gmail_archive", "Archive an email.", { message_id: z.string(), ...profileParam },
+        async ({ message_id, profile }) => { await gmail.archiveMessage(await getGmailAuth(profile), message_id); return { content: [{ type: "text", text: "Archived." }] }; });
+    s.tool("gmail_trash", "Move an email to trash.", { message_id: z.string(), ...profileParam },
+        async ({ message_id, profile }) => { await gmail.trashMessage(await getGmailAuth(profile), message_id); return { content: [{ type: "text", text: "Trashed." }] }; });
+    s.tool("gmail_star", "Star an email.", { message_id: z.string(), ...profileParam },
+        async ({ message_id, profile }) => { await gmail.starMessage(await getGmailAuth(profile), message_id); return { content: [{ type: "text", text: "Starred." }] }; });
+    s.tool("gmail_labels", "List all Gmail labels.", { ...profileParam },
+        async ({ profile }) => ({ content: [{ type: "text", text: json(await gmail.listLabels(await getGmailAuth(profile))) }] }));
+    s.tool("gmail_label_create", "Create a Gmail label.", { name: z.string(), ...profileParam },
+        async ({ name, profile }) => ({ content: [{ type: "text", text: json(await gmail.createLabel(await getGmailAuth(profile), name)) }] }));
+    s.tool("gmail_modify", "Add or remove labels from a message.", { message_id: z.string(), add_labels: z.array(z.string()).optional(), remove_labels: z.array(z.string()).optional(), ...profileParam },
+        async ({ message_id, add_labels, remove_labels, profile }) => { await gmail.modifyMessage(await getGmailAuth(profile), message_id, add_labels || [], remove_labels || []); return { content: [{ type: "text", text: "Labels modified." }] }; });
+
     // Collections
     s.tool("collection_create", "Create a new data collection.", {
         name: z.string(), description: z.string(),
@@ -1276,6 +1696,118 @@ function registerAllTools(s: McpServer) {
         async ({ name }) => { const tool = db.getCustomTool(name); return { content: [{ type: "text", text: tool ? `// ${tool.name}: ${tool.description}\n// params: ${tool.params_schema}\n\n${tool.code}` : `Tool "${name}" not found.` }] }; });
     s.tool("delete_tool", "Delete a custom tool.", { name: z.string() },
         async ({ name }) => { const deleted = db.deleteCustomTool(name); if (deleted) await server.server.sendToolListChanged(); return { content: [{ type: "text", text: deleted ? `Deleted "${name}".` : `Tool "${name}" not found.` }] }; });
+
+    // WhatsApp
+    s.tool("whatsapp_connect", "Connect to WhatsApp. Opens a QR code in the browser on first use. Auto-reconnects after that.", {},
+        async () => {
+            const wa = await import("./integrations/whatsapp.js");
+            const { state } = wa.getConnectionState();
+            if (state === "connected") return { content: [{ type: "text", text: "WhatsApp already connected." }] };
+
+            // Start connecting (non-blocking — triggers QR generation)
+            wa.connect().catch(() => {});
+
+            // Wait briefly for QR or connection
+            const deadline = Date.now() + 10000;
+            while (Date.now() < deadline) {
+                const s = wa.getConnectionState();
+                if (s.state === "connected") return { content: [{ type: "text", text: "WhatsApp connected." }] };
+                if (s.state === "qr" && s.qr) {
+                    // Open QR page in browser via extension
+                    const qrUrl = `http://127.0.0.1:${httpPort}/whatsapp-qr`;
+                    try { await browserCommand("navigate", { url: qrUrl }); } catch {}
+                    // Now wait for the user to scan (up to 60s)
+                    const scanDeadline = Date.now() + 60000;
+                    while (Date.now() < scanDeadline) {
+                        await new Promise(r => setTimeout(r, 2000));
+                        if (wa.getConnectionState().state === "connected") {
+                            return { content: [{ type: "text", text: "WhatsApp connected! QR code scanned successfully." }] };
+                        }
+                    }
+                    return { content: [{ type: "text", text: `QR code opened in browser at ${qrUrl}. Scan it with WhatsApp (Linked Devices > Link a Device), then call whatsapp_connect again.` }] };
+                }
+                await new Promise(r => setTimeout(r, 500));
+            }
+            return { content: [{ type: "text", text: `WhatsApp connection state: ${wa.getConnectionState().state}. Try again.` }] };
+        });
+    s.tool("whatsapp_chats", "List WhatsApp chats with last message and unread count.", { limit: z.number().optional() },
+        async ({ limit }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.getChats(limit || 30)) }] }; });
+    s.tool("whatsapp_search_chats", "Search WhatsApp chats by name.", { query: z.string(), limit: z.number().optional() },
+        async ({ query, limit }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.searchChats(query, limit || 20)) }] }; });
+    s.tool("whatsapp_read", "Read messages from a WhatsApp chat with pagination and search.",
+        { chat: z.string().describe("Chat ID, phone number, or contact name"), limit: z.number().optional(), offset: z.number().optional().describe("Skip N most recent messages"), query: z.string().optional().describe("Filter messages containing this text"), before: z.number().optional().describe("Unix timestamp cursor — only messages before this time") },
+        async ({ chat, limit, offset, query, before }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.readMessages(chat, { limit: limit || 30, offset, query, before })) }] }; });
+    s.tool("whatsapp_search", "Search messages across all WhatsApp chats by text content.",
+        { query: z.string(), chat: z.string().optional().describe("Limit search to a specific chat"), limit: z.number().optional() },
+        async ({ query, chat, limit }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.searchMessages(query, { chatId: chat, limit: limit || 30 })) }] }; });
+    s.tool("whatsapp_send", "Send a WhatsApp text message.", { to: z.string().describe("Phone number, contact name, or chat ID"), text: z.string() },
+        async ({ to, text }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.sendMessage(to, text)) }] }; });
+    s.tool("whatsapp_send_media", "Send media (image, video, document, audio, sticker) on WhatsApp.",
+        { to: z.string(), type: z.enum(["image", "video", "document", "audio", "sticker"]), url: z.string().describe("File URL or local path"), caption: z.string().optional(), filename: z.string().optional(), mimetype: z.string().optional() },
+        async ({ to, type, url, caption, filename, mimetype }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.sendMedia(to, { type, url, caption, filename, mimetype })) }] }; });
+    s.tool("whatsapp_send_location", "Send a location on WhatsApp.", { to: z.string(), latitude: z.number(), longitude: z.number(), name: z.string().optional() },
+        async ({ to, latitude, longitude, name }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.sendLocation(to, latitude, longitude, name)) }] }; });
+    s.tool("whatsapp_send_contact", "Send a contact card on WhatsApp.", { to: z.string(), contact_name: z.string(), contact_phone: z.string().describe("Phone number without + prefix") },
+        async ({ to, contact_name, contact_phone }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.sendContact(to, contact_name, contact_phone)) }] }; });
+    s.tool("whatsapp_check_number", "Check if a phone number is on WhatsApp.", { phone: z.string() },
+        async ({ phone }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.checkOnWhatsApp(phone)) }] }; });
+    s.tool("whatsapp_find_contact", "Search contacts by name or phone number.", { query: z.string() },
+        async ({ query }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.findContact(query)) }] }; });
+    s.tool("whatsapp_profile_pic", "Get profile picture URL for a contact or group.", { chat: z.string() },
+        async ({ chat }) => { const wa = await import("./integrations/whatsapp.js"); const url = await wa.getProfilePicUrl(chat); return { content: [{ type: "text", text: url || "No profile picture." }] }; });
+    s.tool("whatsapp_status", "Get a contact's status/bio.", { chat: z.string() },
+        async ({ chat }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.getStatus(chat)) }] }; });
+    s.tool("whatsapp_update_status", "Update your WhatsApp status/bio.", { status: z.string() },
+        async ({ status }) => { const wa = await import("./integrations/whatsapp.js"); await wa.updateMyStatus(status); return { content: [{ type: "text", text: "Status updated." }] }; });
+    s.tool("whatsapp_presence", "Send presence update (typing indicator, online, etc.).",
+        { type: z.enum(["available", "unavailable", "composing", "paused", "recording"]), chat: z.string().optional().describe("Chat to show typing in") },
+        async ({ type, chat }) => { const wa = await import("./integrations/whatsapp.js"); await wa.sendPresence(type, chat); return { content: [{ type: "text", text: `Presence set to ${type}.` }] }; });
+    s.tool("whatsapp_add_contact", "Create or update a contact.", { phone: z.string(), name: z.string() },
+        async ({ phone, name }) => { const wa = await import("./integrations/whatsapp.js"); await wa.addOrEditContact(phone, name); return { content: [{ type: "text", text: `Contact ${name} saved.` }] }; });
+    s.tool("whatsapp_chat_modify", "Archive, unarchive, mute, unmute, pin, or unpin a chat.",
+        { chat: z.string(), action: z.enum(["archive", "unarchive", "mute", "unmute", "pin", "unpin"]) },
+        async ({ chat, action }) => { const wa = await import("./integrations/whatsapp.js"); await wa.modifyChat(chat, action); return { content: [{ type: "text", text: `Chat ${action}d.` }] }; });
+    s.tool("whatsapp_star", "Star or unstar messages.", { chat: z.string(), message_ids: z.array(z.string()), star: z.boolean() },
+        async ({ chat, message_ids, star }) => { const wa = await import("./integrations/whatsapp.js"); await wa.starMessages(chat, message_ids, star); return { content: [{ type: "text", text: star ? "Messages starred." : "Messages unstarred." }] }; });
+    s.tool("whatsapp_mark_read", "Mark a chat as read.", { chat: z.string() },
+        async ({ chat }) => { const wa = await import("./integrations/whatsapp.js"); await wa.markRead(chat); return { content: [{ type: "text", text: "Marked as read." }] }; });
+    s.tool("whatsapp_block", "Block a contact.", { chat: z.string() },
+        async ({ chat }) => { const wa = await import("./integrations/whatsapp.js"); await wa.blockContact(chat); return { content: [{ type: "text", text: "Blocked." }] }; });
+    s.tool("whatsapp_unblock", "Unblock a contact.", { chat: z.string() },
+        async ({ chat }) => { const wa = await import("./integrations/whatsapp.js"); await wa.unblockContact(chat); return { content: [{ type: "text", text: "Unblocked." }] }; });
+    s.tool("whatsapp_blocklist", "List all blocked contacts.", {},
+        async () => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.getBlocklist()) }] }; });
+    s.tool("whatsapp_group_info", "Get group metadata (members, description, settings).", { group: z.string() },
+        async ({ group }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.getGroupMetadata(group)) }] }; });
+    s.tool("whatsapp_group_create", "Create a new WhatsApp group.", { name: z.string(), participants: z.array(z.string()).describe("Phone numbers or JIDs") },
+        async ({ name, participants }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.createGroup(name, participants)) }] }; });
+    s.tool("whatsapp_group_participants", "Add, remove, promote, or demote group members.",
+        { group: z.string(), participants: z.array(z.string()), action: z.enum(["add", "remove", "promote", "demote"]) },
+        async ({ group, participants, action }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.updateGroupParticipants(group, participants, action)) }] }; });
+    s.tool("whatsapp_group_update_name", "Change a group's name.", { group: z.string(), name: z.string() },
+        async ({ group, name }) => { const wa = await import("./integrations/whatsapp.js"); await wa.updateGroupSubject(group, name); return { content: [{ type: "text", text: "Group name updated." }] }; });
+    s.tool("whatsapp_group_update_description", "Change a group's description.", { group: z.string(), description: z.string() },
+        async ({ group, description }) => { const wa = await import("./integrations/whatsapp.js"); await wa.updateGroupDescription(group, description); return { content: [{ type: "text", text: "Group description updated." }] }; });
+    s.tool("whatsapp_groups_list", "List all groups you're participating in.", {},
+        async () => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.getAllGroups()) }] }; });
+    s.tool("whatsapp_group_invite", "Get the invite link for a group.", { group: z.string() },
+        async ({ group }) => { const wa = await import("./integrations/whatsapp.js"); const code = await wa.getGroupInviteCode(group); return { content: [{ type: "text", text: `https://chat.whatsapp.com/${code}` }] }; });
+    s.tool("whatsapp_group_leave", "Leave a WhatsApp group.", { group: z.string() },
+        async ({ group }) => { const wa = await import("./integrations/whatsapp.js"); await wa.leaveGroup(group); return { content: [{ type: "text", text: "Left group." }] }; });
+    s.tool("whatsapp_newsletter_create", "Create a new WhatsApp channel.", { name: z.string(), description: z.string().optional() },
+        async ({ name, description }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.createNewsletter(name, description)) }] }; });
+    s.tool("whatsapp_newsletter_follow", "Follow a WhatsApp channel.", { jid: z.string() },
+        async ({ jid }) => { const wa = await import("./integrations/whatsapp.js"); await wa.followNewsletter(jid); return { content: [{ type: "text", text: "Followed." }] }; });
+    s.tool("whatsapp_newsletter_unfollow", "Unfollow a WhatsApp channel.", { jid: z.string() },
+        async ({ jid }) => { const wa = await import("./integrations/whatsapp.js"); await wa.unfollowNewsletter(jid); return { content: [{ type: "text", text: "Unfollowed." }] }; });
+    s.tool("whatsapp_newsletter_messages", "Get messages from a WhatsApp channel.", { jid: z.string(), count: z.number().optional() },
+        async ({ jid, count }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.getNewsletterMessages(jid, count || 20)) }] }; });
+    s.tool("whatsapp_newsletter_info", "Get info about a WhatsApp channel.", { jid: z.string() },
+        async ({ jid }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.getNewsletterMetadata(jid)) }] }; });
+    s.tool("whatsapp_business_profile", "Get a business profile.", { chat: z.string() },
+        async ({ chat }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.getBusinessProfile(chat)) }] }; });
+    s.tool("whatsapp_catalog", "Get a business's product catalog.", { chat: z.string(), limit: z.number().optional() },
+        async ({ chat, limit }) => { const wa = await import("./integrations/whatsapp.js"); return { content: [{ type: "text", text: json(await wa.getCatalog(chat, limit || 50)) }] }; });
 }
 
 main().catch(console.error);
