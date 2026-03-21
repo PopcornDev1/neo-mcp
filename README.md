@@ -69,13 +69,16 @@ Go to `Settings > Developer > Edit Config` and add:
 {
   "mcpServers": {
     "neo": {
-      "url": "http://localhost:3100/mcp"
+      "command": "npx",
+      "args": ["mcp-remote", "http://localhost:3100/mcp"]
     }
   }
 }
 ```
 
 Restart Claude Desktop.
+
+> **Note:** Claude Desktop doesn't natively support HTTP transport in its config file, so this uses [`mcp-remote`](https://www.npmjs.com/package/mcp-remote) as a stdio-to-HTTP bridge.
 
 #### Claude Code
 
