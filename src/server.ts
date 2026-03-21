@@ -2210,6 +2210,309 @@ Use this as the first step when building a new integration for ANY website.`,
     }
 );
 
+// ── Web Scrape (structured data extraction) ──────────────────────────────────
+
+server.tool(
+    "web_scrape",
+    `Extract structured data from any URL. Returns clean, parsed content instead of raw HTML. Extracts: page title, meta description, main text content, all links, tables (as arrays), images, OpenGraph/meta tags, and JSON-LD structured data. Use this instead of authenticated_fetch when you need usable data from a page.`,
+    {
+        url: z.string().describe("URL to scrape"),
+        extract: z.array(z.enum(["text", "links", "tables", "images", "meta", "structured_data", "all"])).optional()
+            .describe("What to extract (default: all)"),
+        selector: z.string().optional().describe("CSS selector to scope extraction (e.g. 'article', '.content', '#main')"),
+    },
+    async ({ url, extract, selector }) => {
+        if (!isBridgeConnected()) {
+            return { content: [{ type: "text", text: "Browser extension not connected." }] };
+        }
+
+        // Navigate and get page content via browser
+        await browserCommand("navigate", { url });
+        await new Promise(r => setTimeout(r, 3000)); // Wait for page load
+
+        const extractAll = !extract || extract.includes("all");
+        const wants = (t: string) => extractAll || extract?.includes(t as any);
+
+        // Execute extraction script in the browser
+        const script = `
+        (function() {
+            const scope = ${selector ? `document.querySelector(${JSON.stringify(selector)})` : 'document'} || document;
+            const result = {};
+
+            // Title & meta
+            result.url = window.location.href;
+            result.title = document.title || '';
+
+            ${wants("meta") || wants("text") ? `
+            // Meta tags
+            const metaDesc = document.querySelector('meta[name="description"]');
+            result.meta = {
+                description: metaDesc ? metaDesc.content : '',
+                og: {},
+            };
+            document.querySelectorAll('meta[property^="og:"]').forEach(m => {
+                const key = m.getAttribute('property').replace('og:', '');
+                result.meta.og[key] = m.content;
+            });
+            document.querySelectorAll('meta[name^="twitter:"]').forEach(m => {
+                const key = m.getAttribute('name').replace('twitter:', '');
+                result.meta['twitter_' + key] = m.content;
+            });
+            const canonical = document.querySelector('link[rel="canonical"]');
+            if (canonical) result.meta.canonical = canonical.href;
+            ` : ''}
+
+            ${wants("text") ? `
+            // Main text content — try article/main first, fall back to body
+            const contentEl = scope.querySelector('article') || scope.querySelector('[role="main"]') || scope.querySelector('main') || scope.querySelector('.content') || scope.querySelector('#content') || scope;
+            // Remove scripts, styles, nav, footer, header, ads
+            const clone = contentEl.cloneNode(true);
+            clone.querySelectorAll('script, style, nav, footer, header, aside, .ad, .ads, .advertisement, [role="navigation"], [role="banner"], [role="contentinfo"]').forEach(el => el.remove());
+            const textContent = clone.innerText || clone.textContent || '';
+            // Clean up whitespace
+            result.text = textContent.replace(/\\n{3,}/g, '\\n\\n').replace(/[ \\t]+/g, ' ').trim().slice(0, 50000);
+            result.text_length = result.text.length;
+            result.word_count = result.text.split(/\\s+/).filter(w => w).length;
+            ` : ''}
+
+            ${wants("links") ? `
+            // Links
+            const links = [];
+            scope.querySelectorAll('a[href]').forEach(a => {
+                const href = a.href;
+                const text = (a.innerText || '').trim().slice(0, 200);
+                if (href && !href.startsWith('javascript:') && text) {
+                    links.push({ text, href });
+                }
+            });
+            // Deduplicate by href
+            const seen = new Set();
+            result.links = links.filter(l => { if (seen.has(l.href)) return false; seen.add(l.href); return true; }).slice(0, 200);
+            result.link_count = result.links.length;
+            ` : ''}
+
+            ${wants("tables") ? `
+            // Tables
+            result.tables = [];
+            scope.querySelectorAll('table').forEach((table, idx) => {
+                const rows = [];
+                table.querySelectorAll('tr').forEach(tr => {
+                    const cells = [];
+                    tr.querySelectorAll('th, td').forEach(td => {
+                        cells.push((td.innerText || '').trim());
+                    });
+                    if (cells.length > 0) rows.push(cells);
+                });
+                if (rows.length > 0) {
+                    result.tables.push({ index: idx, headers: rows[0], rows: rows.slice(1, 100) });
+                }
+            });
+            ` : ''}
+
+            ${wants("images") ? `
+            // Images
+            result.images = [];
+            scope.querySelectorAll('img[src]').forEach(img => {
+                const src = img.src;
+                const alt = img.alt || '';
+                const w = img.naturalWidth || img.width;
+                const h = img.naturalHeight || img.height;
+                if (src && w > 50 && h > 50) { // Skip tiny icons
+                    result.images.push({ src, alt, width: w, height: h });
+                }
+            });
+            result.images = result.images.slice(0, 50);
+            ` : ''}
+
+            ${wants("structured_data") ? `
+            // JSON-LD structured data
+            result.structured_data = [];
+            document.querySelectorAll('script[type="application/ld+json"]').forEach(s => {
+                try { result.structured_data.push(JSON.parse(s.textContent)); } catch {}
+            });
+            ` : ''}
+
+            return result;
+        })()
+        `;
+
+        try {
+            const data = await browserCommand("execute_script", { code: script });
+            return { content: [{ type: "text", text: json(data) }] };
+        } catch (err: any) {
+            // Fallback: try getting page text via simpler method
+            try {
+                const textScript = `({ url: window.location.href, title: document.title, text: document.body.innerText.slice(0, 30000) })`;
+                const fallback = await browserCommand("execute_script", { code: textScript });
+                return { content: [{ type: "text", text: json({ ...fallback, note: "Partial extraction (full script failed)" }) }] };
+            } catch {
+                return { content: [{ type: "text", text: `Scrape failed: ${err.message}` }] };
+            }
+        }
+    }
+);
+
+// ── Diff Monitor (watch anything for changes) ────────────────────────────────
+
+server.tool(
+    "diff_monitor",
+    `Monitor any URL or API endpoint for changes. Stores snapshots in a collection, compares against the previous snapshot, and reports what changed. Use for: price tracking, job posting changes, competitor monitoring, stock availability, or any "tell me when X changes" request.`,
+    {
+        action: z.enum(["check", "list", "history", "remove"]).describe("check: take snapshot & compare, list: show all monitors, history: show snapshots for a monitor, remove: stop monitoring"),
+        url: z.string().optional().describe("URL to monitor (for check action)"),
+        name: z.string().optional().describe("Friendly name for this monitor (for check/remove/history)"),
+        selector: z.string().optional().describe("CSS selector to monitor specific content (for check)"),
+        extract: z.enum(["text", "html", "json"]).optional().describe("What to extract: text (default), html, or json (for API endpoints)"),
+    },
+    async ({ action, url, name, selector, extract }) => {
+        const COLLECTION = "diff_monitor";
+
+        // Ensure collection exists
+        try {
+            db.createCollection(COLLECTION, "Page change monitoring snapshots", [
+                { name: "monitor_name", type: "text" },
+                { name: "url", type: "text" },
+                { name: "selector", type: "text" },
+                { name: "extract_type", type: "text" },
+                { name: "content_hash", type: "text" },
+                { name: "content", type: "text" },
+                { name: "checked_at", type: "text" },
+                { name: "changed", type: "boolean" },
+                { name: "diff_summary", type: "text" },
+            ]);
+        } catch {} // Already exists
+
+        if (action === "list") {
+            // Get unique monitors
+            const all = db.collectionQuery(COLLECTION, { orderBy: "checked_at DESC", limit: 200 }) as any[];
+            const monitors = new Map<string, any>();
+            for (const row of all) {
+                if (!monitors.has(row.monitor_name)) {
+                    monitors.set(row.monitor_name, {
+                        name: row.monitor_name,
+                        url: row.url,
+                        selector: row.selector || null,
+                        last_checked: row.checked_at,
+                        last_changed: row.changed ? row.checked_at : null,
+                        snapshot_count: 0,
+                    });
+                }
+                const m = monitors.get(row.monitor_name)!;
+                m.snapshot_count++;
+                if (row.changed && (!m.last_changed || row.checked_at > m.last_changed)) {
+                    m.last_changed = row.checked_at;
+                }
+            }
+            return { content: [{ type: "text", text: json([...monitors.values()]) }] };
+        }
+
+        if (action === "history") {
+            if (!name) return { content: [{ type: "text", text: "Provide a monitor name." }] };
+            const snapshots = db.collectionQuery(COLLECTION, { where: { monitor_name: name }, orderBy: "checked_at DESC", limit: 20 }) as any[];
+            return { content: [{ type: "text", text: json(snapshots.map(s => ({ checked_at: s.checked_at, changed: s.changed, diff_summary: s.diff_summary, content_preview: (s.content || "").slice(0, 200) }))) }] };
+        }
+
+        if (action === "remove") {
+            if (!name) return { content: [{ type: "text", text: "Provide a monitor name to remove." }] };
+            const rows = db.collectionQuery(COLLECTION, { where: { monitor_name: name } }) as any[];
+            let removed = 0;
+            for (const row of rows) {
+                try { db.collectionDelete(COLLECTION, row.id); removed++; } catch {}
+            }
+            return { content: [{ type: "text", text: `Removed monitor "${name}" (${removed} snapshots deleted).` }] };
+        }
+
+        // action === "check"
+        if (!url) return { content: [{ type: "text", text: "Provide a URL to monitor." }] };
+        const monitorName = name || new URL(url).hostname + new URL(url).pathname;
+        const extractType = extract || "text";
+
+        // Fetch current content
+        let currentContent = "";
+        try {
+            if (extractType === "json") {
+                // API endpoint — use authenticated_fetch
+                const result = await browserCommand("browser_fetch", { url, method: "GET", credentials: "include" });
+                currentContent = typeof result.body === "string" ? result.body : JSON.stringify(result.body);
+            } else {
+                // Web page — navigate and extract
+                await browserCommand("navigate", { url });
+                await new Promise(r => setTimeout(r, 3000));
+
+                const script = selector
+                    ? `(document.querySelector(${JSON.stringify(selector)}) || document.body).${extractType === "html" ? "innerHTML" : "innerText"}`
+                    : `document.body.${extractType === "html" ? "innerHTML" : "innerText"}`;
+                currentContent = await browserCommand("execute_script", { code: script }) || "";
+                if (typeof currentContent !== "string") currentContent = JSON.stringify(currentContent);
+            }
+        } catch (err: any) {
+            return { content: [{ type: "text", text: `Failed to fetch ${url}: ${err.message}` }] };
+        }
+
+        // Simple content hash
+        let hash = 0;
+        for (let i = 0; i < currentContent.length; i++) {
+            hash = ((hash << 5) - hash + currentContent.charCodeAt(i)) | 0;
+        }
+        const contentHash = hash.toString(36);
+
+        // Get previous snapshot
+        const previous = (db.collectionQuery(COLLECTION, {
+            where: { monitor_name: monitorName },
+            orderBy: "checked_at DESC",
+            limit: 1,
+        }) as any[])[0];
+
+        let changed = true;
+        let diffSummary = "First snapshot — baseline recorded.";
+
+        if (previous) {
+            changed = previous.content_hash !== contentHash;
+            if (changed) {
+                // Generate diff summary
+                const prevLines = (previous.content || "").split("\\n");
+                const currLines = currentContent.split("\\n");
+                const added = currLines.filter((l: string) => !prevLines.includes(l)).slice(0, 10);
+                const removed = prevLines.filter((l: string) => !currLines.includes(l)).slice(0, 10);
+                const parts: string[] = [];
+                if (added.length > 0) parts.push(`Added (${added.length} lines): ${added.map((l: string) => l.slice(0, 80)).join(" | ")}`);
+                if (removed.length > 0) parts.push(`Removed (${removed.length} lines): ${removed.map((l: string) => l.slice(0, 80)).join(" | ")}`);
+                diffSummary = parts.join("\\n") || "Content changed (binary diff)";
+            } else {
+                diffSummary = "No changes detected.";
+            }
+        }
+
+        // Store snapshot (truncate content to 50KB to avoid DB bloat)
+        db.collectionInsert(COLLECTION, {
+            monitor_name: monitorName,
+            url,
+            selector: selector || "",
+            extract_type: extractType,
+            content_hash: contentHash,
+            content: currentContent.slice(0, 50000),
+            checked_at: new Date().toISOString(),
+            changed,
+            diff_summary: diffSummary,
+        });
+
+        return {
+            content: [{
+                type: "text",
+                text: json({
+                    monitor: monitorName,
+                    url,
+                    changed,
+                    diff_summary: diffSummary,
+                    content_preview: currentContent.slice(0, 500),
+                    checked_at: new Date().toISOString(),
+                    previous_check: previous?.checked_at || null,
+                }),
+            }],
+        };
+    }
+);
+
 server.tool(
     "list_custom_tools",
     "List all custom tools that have been created.",
@@ -3074,6 +3377,42 @@ function registerAllTools(s: McpServer) {
         for (const r of (dataReqs.length > 0 ? dataReqs : apiReqs).slice(0, 30)) { results.push(`  [${r.id}] ${r.method || "GET"} ${r.status || "?"} ${r.url}`); }
         results.push(`\nAuth stored under "${domain}". Use network_request_detail(id) to inspect, then create_tool() to save.`);
         return { content: [{ type: "text", text: results.join("\n") }] };
+    });
+    s.tool("web_scrape", "Extract structured data from any URL (text, links, tables, images, meta, JSON-LD).", {
+        url: z.string(), extract: z.array(z.enum(["text", "links", "tables", "images", "meta", "structured_data", "all"])).optional(), selector: z.string().optional(),
+    }, async ({ url, extract, selector }) => {
+        if (!isBridgeConnected()) return { content: [{ type: "text", text: "Browser not connected." }] };
+        await browserCommand("navigate", { url });
+        await new Promise(r => setTimeout(r, 3000));
+        const extractAll = !extract || extract.includes("all");
+        const w = (t: string) => extractAll || extract?.includes(t as any);
+        const script = `(function(){const s=${selector?`document.querySelector(${JSON.stringify(selector)})`:'document'}||document;const r={url:location.href,title:document.title};${w("meta")?`r.meta={};const md=document.querySelector('meta[name="description"]');r.meta.description=md?md.content:'';document.querySelectorAll('meta[property^="og:"]').forEach(m=>{r.meta[m.getAttribute('property')]=m.content});`:''}${w("text")?`const ce=s.querySelector('article')||s.querySelector('main')||s.querySelector('.content')||s;const cl=ce.cloneNode(true);cl.querySelectorAll('script,style,nav,footer,header,aside').forEach(e=>e.remove());r.text=(cl.innerText||'').replace(/\\n{3,}/g,'\\n\\n').trim().slice(0,50000);r.word_count=r.text.split(/\\s+/).length;`:''}${w("links")?`const ls=[];const sn=new Set();s.querySelectorAll('a[href]').forEach(a=>{if(a.href&&!a.href.startsWith('javascript:')&&a.innerText.trim()&&!sn.has(a.href)){sn.add(a.href);ls.push({text:a.innerText.trim().slice(0,200),href:a.href})}});r.links=ls.slice(0,200);`:''}${w("tables")?`r.tables=[];s.querySelectorAll('table').forEach((t,i)=>{const rows=[];t.querySelectorAll('tr').forEach(tr=>{const c=[];tr.querySelectorAll('th,td').forEach(td=>c.push(td.innerText.trim()));if(c.length)rows.push(c)});if(rows.length)r.tables.push({headers:rows[0],rows:rows.slice(1,100)})});`:''}${w("images")?`r.images=[];s.querySelectorAll('img[src]').forEach(i=>{if(i.naturalWidth>50)r.images.push({src:i.src,alt:i.alt||'',w:i.naturalWidth,h:i.naturalHeight})});r.images=r.images.slice(0,50);`:''}${w("structured_data")?`r.structured_data=[];document.querySelectorAll('script[type="application/ld+json"]').forEach(s=>{try{r.structured_data.push(JSON.parse(s.textContent))}catch{}});`:''}return r})()`;
+        try { const data = await browserCommand("execute_script", { code: script }); return { content: [{ type: "text", text: json(data) }] }; }
+        catch (e: any) { try { const fb = await browserCommand("execute_script", { code: `({url:location.href,title:document.title,text:document.body.innerText.slice(0,30000)})` }); return { content: [{ type: "text", text: json({...fb, note: "Partial extraction"}) }] }; } catch { return { content: [{ type: "text", text: `Scrape failed: ${e.message}` }] }; } }
+    });
+    s.tool("diff_monitor", "Monitor any URL for changes. Stores snapshots, compares, reports diffs.", {
+        action: z.enum(["check", "list", "history", "remove"]),
+        url: z.string().optional(), name: z.string().optional(), selector: z.string().optional(), extract: z.enum(["text", "html", "json"]).optional(),
+    }, async ({ action, url, name, selector, extract: ext }) => {
+        const CN = "diff_monitor";
+        try { db.createCollection(CN, "Page change monitoring", [{ name: "monitor_name", type: "text" },{ name: "url", type: "text" },{ name: "selector", type: "text" },{ name: "extract_type", type: "text" },{ name: "content_hash", type: "text" },{ name: "content", type: "text" },{ name: "checked_at", type: "text" },{ name: "changed", type: "boolean" },{ name: "diff_summary", type: "text" }]); } catch {}
+        if (action === "list") { const all = db.collectionQuery(CN, { orderBy: "checked_at DESC", limit: 200 }) as any[]; const m = new Map<string,any>(); for (const r of all) { if (!m.has(r.monitor_name)) m.set(r.monitor_name, { name: r.monitor_name, url: r.url, last_checked: r.checked_at, snapshots: 0 }); m.get(r.monitor_name).snapshots++; } return { content: [{ type: "text", text: json([...m.values()]) }] }; }
+        if (action === "history") { if (!name) return { content: [{ type: "text", text: "Provide name." }] }; const s = db.collectionQuery(CN, { where: { monitor_name: name }, orderBy: "checked_at DESC", limit: 20 }) as any[]; return { content: [{ type: "text", text: json(s.map(x => ({ checked_at: x.checked_at, changed: x.changed, diff: x.diff_summary, preview: (x.content||"").slice(0,200) }))) }] }; }
+        if (action === "remove") { if (!name) return { content: [{ type: "text", text: "Provide name." }] }; const rows = db.collectionQuery(CN, { where: { monitor_name: name } }) as any[]; for (const r of rows) { try { db.collectionDelete(CN, r.id); } catch {} } return { content: [{ type: "text", text: `Removed "${name}" (${rows.length} snapshots).` }] }; }
+        if (!url) return { content: [{ type: "text", text: "Provide URL." }] };
+        const mn = name || new URL(url).hostname + new URL(url).pathname;
+        let content = "";
+        try {
+            if ((ext || "text") === "json") { const r = await browserCommand("browser_fetch", { url, method: "GET", credentials: "include" }); content = typeof r.body === "string" ? r.body : JSON.stringify(r.body); }
+            else { await browserCommand("navigate", { url }); await new Promise(r => setTimeout(r, 3000)); const sc = selector ? `(document.querySelector(${JSON.stringify(selector)})||document.body).${ext==="html"?"innerHTML":"innerText"}` : `document.body.${ext==="html"?"innerHTML":"innerText"}`; content = (await browserCommand("execute_script", { code: sc })) || ""; if (typeof content !== "string") content = JSON.stringify(content); }
+        } catch (e: any) { return { content: [{ type: "text", text: `Fetch failed: ${e.message}` }] }; }
+        let h = 0; for (let i = 0; i < content.length; i++) h = ((h << 5) - h + content.charCodeAt(i)) | 0;
+        const ch = h.toString(36);
+        const prev = (db.collectionQuery(CN, { where: { monitor_name: mn }, orderBy: "checked_at DESC", limit: 1 }) as any[])[0];
+        let changed = true, diff = "First snapshot — baseline.";
+        if (prev) { changed = prev.content_hash !== ch; diff = changed ? "Content changed." : "No changes."; }
+        db.collectionInsert(CN, { monitor_name: mn, url, selector: selector||"", extract_type: ext||"text", content_hash: ch, content: content.slice(0, 50000), checked_at: new Date().toISOString(), changed, diff_summary: diff });
+        return { content: [{ type: "text", text: json({ monitor: mn, url, changed, diff, preview: content.slice(0, 500), checked_at: new Date().toISOString() }) }] };
     });
     s.tool("list_custom_tools", "List all custom tools.", {}, async () => {
         const tools = db.getCustomTools();
