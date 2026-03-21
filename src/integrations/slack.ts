@@ -24,7 +24,7 @@ async function slackApi<T = any>(
     if (isClientToken) {
         const body = new URLSearchParams({ token: auth.token, ...params });
         const headers: Record<string, string> = { "Content-Type": "application/x-www-form-urlencoded" };
-        if (auth.cookie) headers["Cookie"] = `d=${auth.cookie}`;
+        if (auth.cookie) headers["Cookie"] = auth.cookie;
         const res = await fetch(`${API}/${method}`, { method: "POST", headers, body: body.toString() });
         const data = await res.json();
         if (!data.ok) throw new Error(`Slack ${method}: ${data.error}`);
@@ -49,7 +49,7 @@ async function slackApiJson<T = any>(
         const form = new URLSearchParams({ token: auth.token });
         for (const [k, v] of Object.entries(body)) form.set(k, typeof v === "string" ? v : JSON.stringify(v));
         const headers: Record<string, string> = { "Content-Type": "application/x-www-form-urlencoded" };
-        if (auth.cookie) headers["Cookie"] = `d=${auth.cookie}`;
+        if (auth.cookie) headers["Cookie"] = auth.cookie;
         const res = await fetch(`${API}/${method}`, { method: "POST", headers, body: form.toString() });
         const data = await res.json();
         if (!data.ok) throw new Error(`Slack ${method}: ${data.error}`);

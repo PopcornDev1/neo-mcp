@@ -120,7 +120,8 @@ function getSlackAuth(profile?: string): slack.SlackAuth {
     const creds = getAuth(profileKey("slack", profile));
     const token = creds.xoxc_token || creds.token || creds.xoxc || creds.xoxp || creds.xoxb;
     if (!token) throw new Error(`Missing Slack token (have keys: ${Object.keys(creds).join(", ")}). Run extract_auth for slack${profile ? ` (profile: ${profile})` : ""}.`);
-    return { token, cookie: creds.d_cookie || creds.d || creds.cookie };
+    // Prefer full cookie jar, fall back to just the d cookie
+    return { token, cookie: creds._cookies || (creds.d_cookie ? `d=${creds.d_cookie}` : undefined) };
 }
 
 
@@ -142,9 +143,15 @@ server.tool(
         // Store extracted tokens in db + in-memory fallback
         const creds: Record<string, string> = {};
         for (const [key, value] of Object.entries(result)) {
-            if (key === "service" || key === "cookies" || !value || typeof value !== "string") continue;
+            if (key === "service" || !value || typeof value !== "string") continue;
             creds[key] = value as string;
             try { db.storeCredential(storageKey, key, value as string); } catch {}
+        }
+        // Store full cookie jar as a cookie header string
+        if (Array.isArray(result.cookies) && result.cookies.length > 0) {
+            const cookieHeader = result.cookies.map((c: any) => `${c.name}=${c.value}`).join("; ");
+            creds._cookies = cookieHeader;
+            try { db.storeCredential(storageKey, "_cookies", cookieHeader); } catch {}
         }
         storeAuthInMemory(storageKey, creds);
         const label = profile ? ` as profile "${profile}"` : "";
@@ -1173,9 +1180,14 @@ function registerAllTools(s: McpServer) {
             const storageKey = profileKey(service, profile);
             const creds: Record<string, string> = {};
             for (const [key, value] of Object.entries(result)) {
-                if (key === "service" || key === "cookies" || !value || typeof value !== "string") continue;
+                if (key === "service" || !value || typeof value !== "string") continue;
                 creds[key] = value as string;
                 try { db.storeCredential(storageKey, key, value as string); } catch {}
+            }
+            if (Array.isArray(result.cookies) && result.cookies.length > 0) {
+                const cookieHeader = result.cookies.map((c: any) => `${c.name}=${c.value}`).join("; ");
+                creds._cookies = cookieHeader;
+                try { db.storeCredential(storageKey, "_cookies", cookieHeader); } catch {}
             }
             storeAuthInMemory(storageKey, creds);
             const label = profile ? ` as profile "${profile}"` : "";
