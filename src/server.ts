@@ -18,14 +18,16 @@ import express from "express";
 import { randomUUID } from "node:crypto";
 import * as linkedin from "./integrations/linkedin.js";
 import * as twitter from "./integrations/twitter.js";
+import * as slack from "./integrations/slack.js";
 import * as db from "./db.js";
 import { browserCommand, startBridge, isBridgeConnected } from "./bridge.js";
 
-const NEO_INSTRUCTIONS = `Neo is a browser bridge that lets you operate the user's real accounts — LinkedIn, Twitter/X, WhatsApp, and ANY website they're logged into. No API keys needed.
+const NEO_INSTRUCTIONS = `Neo is a browser bridge that lets you operate the user's real accounts — LinkedIn, Twitter/X, Slack, WhatsApp, and ANY website they're logged into. No API keys needed.
 
 ## Built-in services
 - LinkedIn: extract_auth("linkedin") once, then use linkedin_* tools
 - Twitter/X: extract_auth("twitter") once, then use twitter_* tools
+- Slack: extract_auth("slack") once, then use slack_* tools
 - WhatsApp: whatsapp_connect (QR code first time, auto-reconnects after)
 
 ## When a built-in tool doesn't exist for what the user wants
@@ -112,6 +114,13 @@ function getTwitterAuth(profile?: string): twitter.TwitterAuth {
     const creds = getAuth(profileKey("twitter", profile));
     if (!creds.auth_token) throw new Error(`Missing auth_token. Run extract_auth for twitter${profile ? ` (profile: ${profile})` : ""}.`);
     return { auth_token: creds.auth_token, csrf_token: creds.csrf_token || "" };
+}
+
+function getSlackAuth(profile?: string): slack.SlackAuth {
+    const creds = getAuth(profileKey("slack", profile));
+    const token = creds.token || creds.xoxc || creds.xoxp || creds.xoxb;
+    if (!token) throw new Error(`Missing Slack token. Run extract_auth for slack${profile ? ` (profile: ${profile})` : ""}.`);
+    return { token, cookie: creds.d || creds.cookie };
 }
 
 
@@ -442,6 +451,77 @@ server.tool(
         return { content: [{ type: "text", text: result ? "Deleted." : "Row not found." }] };
     }
 );
+
+// ── Slack ─────────────────────────────────────────────────────────────────────
+
+server.tool("slack_channels", "List Slack channels.", { ...profileParam },
+    async ({ profile }) => ({ content: [{ type: "text", text: json(await slack.listChannels(getSlackAuth(profile))) }] }));
+
+server.tool("slack_channel_info", "Get details about a Slack channel.", { channel: z.string().describe("Channel name or ID"), ...profileParam },
+    async ({ channel, profile }) => ({ content: [{ type: "text", text: json(await slack.getChannelInfo(getSlackAuth(profile), channel)) }] }));
+
+server.tool("slack_read", "Read messages from a Slack channel.", { channel: z.string(), limit: z.number().optional(), oldest: z.number().optional().describe("Unix timestamp ms — only messages after this"), latest: z.number().optional().describe("Unix timestamp ms — only messages before this"), ...profileParam },
+    async ({ channel, limit, oldest, latest, profile }) => ({ content: [{ type: "text", text: json(await slack.readMessages(getSlackAuth(profile), channel, { limit: limit || 50, oldest, latest })) }] }));
+
+server.tool("slack_thread", "Read a Slack thread.", { channel: z.string(), thread_ts: z.string().describe("Thread timestamp ID"), limit: z.number().optional(), ...profileParam },
+    async ({ channel, thread_ts, limit, profile }) => ({ content: [{ type: "text", text: json(await slack.readThread(getSlackAuth(profile), channel, thread_ts, limit || 50)) }] }));
+
+server.tool("slack_dms", "Read recent DMs.", { limit: z.number().optional(), ...profileParam },
+    async ({ limit, profile }) => ({ content: [{ type: "text", text: json(await slack.readDMs(getSlackAuth(profile), limit || 20)) }] }));
+
+server.tool("slack_search", "Search Slack messages.", { query: z.string(), limit: z.number().optional(), sort: z.enum(["score", "timestamp"]).optional(), ...profileParam },
+    async ({ query, limit, sort, profile }) => ({ content: [{ type: "text", text: json(await slack.searchMessages(getSlackAuth(profile), query, { limit: limit || 20, sort })) }] }));
+
+server.tool("slack_send", "Send a message to a Slack channel or DM.", { channel: z.string(), text: z.string(), thread_ts: z.string().optional().describe("Reply in thread"), ...profileParam },
+    async ({ channel, text, thread_ts, profile }) => { const ts = await slack.postMessage(getSlackAuth(profile), channel, text, thread_ts); return { content: [{ type: "text", text: `Sent (ts: ${ts}).` }] }; });
+
+server.tool("slack_react", "Add a reaction emoji to a message.", { channel: z.string(), timestamp: z.string(), emoji: z.string().describe("Emoji name without colons"), ...profileParam },
+    async ({ channel, timestamp, emoji, profile }) => { await slack.addReaction(getSlackAuth(profile), channel, timestamp, emoji); return { content: [{ type: "text", text: "Reacted." }] }; });
+
+server.tool("slack_unreact", "Remove a reaction from a message.", { channel: z.string(), timestamp: z.string(), emoji: z.string(), ...profileParam },
+    async ({ channel, timestamp, emoji, profile }) => { await slack.removeReaction(getSlackAuth(profile), channel, timestamp, emoji); return { content: [{ type: "text", text: "Reaction removed." }] }; });
+
+server.tool("slack_edit", "Edit a Slack message.", { channel: z.string(), timestamp: z.string(), text: z.string(), ...profileParam },
+    async ({ channel, timestamp, text, profile }) => { await slack.updateMessage(getSlackAuth(profile), channel, timestamp, text); return { content: [{ type: "text", text: "Message updated." }] }; });
+
+server.tool("slack_delete", "Delete a Slack message.", { channel: z.string(), timestamp: z.string(), ...profileParam },
+    async ({ channel, timestamp, profile }) => { await slack.deleteMessage(getSlackAuth(profile), channel, timestamp); return { content: [{ type: "text", text: "Deleted." }] }; });
+
+server.tool("slack_users", "List Slack workspace users.", { ...profileParam },
+    async ({ profile }) => ({ content: [{ type: "text", text: json(await slack.listUsers(getSlackAuth(profile))) }] }));
+
+server.tool("slack_user_profile", "Get a Slack user's profile.", { user_id: z.string(), ...profileParam },
+    async ({ user_id, profile }) => ({ content: [{ type: "text", text: json(await slack.getUserProfile(getSlackAuth(profile), user_id)) }] }));
+
+server.tool("slack_set_status", "Set your Slack status.", { text: z.string(), emoji: z.string().optional().describe("Status emoji e.g. :house_with_garden:"), expiration: z.number().optional().describe("Unix timestamp when status expires"), ...profileParam },
+    async ({ text, emoji, expiration, profile }) => { await slack.setStatus(getSlackAuth(profile), text, emoji, expiration); return { content: [{ type: "text", text: "Status set." }] }; });
+
+server.tool("slack_create_channel", "Create a Slack channel.", { name: z.string(), is_private: z.boolean().optional(), ...profileParam },
+    async ({ name, is_private, profile }) => ({ content: [{ type: "text", text: json(await slack.createChannel(getSlackAuth(profile), name, is_private)) }] }));
+
+server.tool("slack_archive_channel", "Archive a Slack channel.", { channel: z.string(), ...profileParam },
+    async ({ channel, profile }) => { await slack.archiveChannel(getSlackAuth(profile), channel); return { content: [{ type: "text", text: "Archived." }] }; });
+
+server.tool("slack_invite", "Invite users to a channel.", { channel: z.string(), user_ids: z.array(z.string()), ...profileParam },
+    async ({ channel, user_ids, profile }) => { await slack.inviteToChannel(getSlackAuth(profile), channel, user_ids); return { content: [{ type: "text", text: "Invited." }] }; });
+
+server.tool("slack_kick", "Remove a user from a channel.", { channel: z.string(), user_id: z.string(), ...profileParam },
+    async ({ channel, user_id, profile }) => { await slack.kickFromChannel(getSlackAuth(profile), channel, user_id); return { content: [{ type: "text", text: "Removed." }] }; });
+
+server.tool("slack_set_topic", "Set a channel's topic.", { channel: z.string(), topic: z.string(), ...profileParam },
+    async ({ channel, topic, profile }) => { await slack.setChannelTopic(getSlackAuth(profile), channel, topic); return { content: [{ type: "text", text: "Topic set." }] }; });
+
+server.tool("slack_set_purpose", "Set a channel's purpose.", { channel: z.string(), purpose: z.string(), ...profileParam },
+    async ({ channel, purpose, profile }) => { await slack.setChannelPurpose(getSlackAuth(profile), channel, purpose); return { content: [{ type: "text", text: "Purpose set." }] }; });
+
+server.tool("slack_pin", "Pin a message.", { channel: z.string(), timestamp: z.string(), ...profileParam },
+    async ({ channel, timestamp, profile }) => { await slack.pinMessage(getSlackAuth(profile), channel, timestamp); return { content: [{ type: "text", text: "Pinned." }] }; });
+
+server.tool("slack_unpin", "Unpin a message.", { channel: z.string(), timestamp: z.string(), ...profileParam },
+    async ({ channel, timestamp, profile }) => { await slack.unpinMessage(getSlackAuth(profile), channel, timestamp); return { content: [{ type: "text", text: "Unpinned." }] }; });
+
+server.tool("slack_pins", "List pinned messages in a channel.", { channel: z.string(), ...profileParam },
+    async ({ channel, profile }) => ({ content: [{ type: "text", text: json(await slack.listPins(getSlackAuth(profile), channel)) }] }));
 
 // ── WhatsApp ─────────────────────────────────────────────────────────────────
 
@@ -1183,6 +1263,54 @@ function registerAllTools(s: McpServer) {
         async ({ text, reply_to, profile }) => ({ content: [{ type: "text", text: json(await twitter.createTweet(getTwitterAuth(profile), text, reply_to)) }] }));
     s.tool("twitter_search", "Search tweets.", { query: z.string(), count: z.number().optional(), ...profileParam },
         async ({ query, count, profile }) => ({ content: [{ type: "text", text: json(await twitter.searchTweets(getTwitterAuth(profile), query, count || 20)) }] }));
+
+    // Slack
+    s.tool("slack_channels", "List Slack channels.", { ...profileParam },
+        async ({ profile }) => ({ content: [{ type: "text", text: json(await slack.listChannels(getSlackAuth(profile))) }] }));
+    s.tool("slack_channel_info", "Get details about a Slack channel.", { channel: z.string(), ...profileParam },
+        async ({ channel, profile }) => ({ content: [{ type: "text", text: json(await slack.getChannelInfo(getSlackAuth(profile), channel)) }] }));
+    s.tool("slack_read", "Read messages from a Slack channel.", { channel: z.string(), limit: z.number().optional(), oldest: z.number().optional(), latest: z.number().optional(), ...profileParam },
+        async ({ channel, limit, oldest, latest, profile }) => ({ content: [{ type: "text", text: json(await slack.readMessages(getSlackAuth(profile), channel, { limit: limit || 50, oldest, latest })) }] }));
+    s.tool("slack_thread", "Read a Slack thread.", { channel: z.string(), thread_ts: z.string(), limit: z.number().optional(), ...profileParam },
+        async ({ channel, thread_ts, limit, profile }) => ({ content: [{ type: "text", text: json(await slack.readThread(getSlackAuth(profile), channel, thread_ts, limit || 50)) }] }));
+    s.tool("slack_dms", "Read recent DMs.", { limit: z.number().optional(), ...profileParam },
+        async ({ limit, profile }) => ({ content: [{ type: "text", text: json(await slack.readDMs(getSlackAuth(profile), limit || 20)) }] }));
+    s.tool("slack_search", "Search Slack messages.", { query: z.string(), limit: z.number().optional(), sort: z.enum(["score", "timestamp"]).optional(), ...profileParam },
+        async ({ query, limit, sort, profile }) => ({ content: [{ type: "text", text: json(await slack.searchMessages(getSlackAuth(profile), query, { limit: limit || 20, sort })) }] }));
+    s.tool("slack_send", "Send a message to a Slack channel or DM.", { channel: z.string(), text: z.string(), thread_ts: z.string().optional(), ...profileParam },
+        async ({ channel, text, thread_ts, profile }) => { const ts = await slack.postMessage(getSlackAuth(profile), channel, text, thread_ts); return { content: [{ type: "text", text: `Sent (ts: ${ts}).` }] }; });
+    s.tool("slack_react", "Add a reaction emoji to a message.", { channel: z.string(), timestamp: z.string(), emoji: z.string(), ...profileParam },
+        async ({ channel, timestamp, emoji, profile }) => { await slack.addReaction(getSlackAuth(profile), channel, timestamp, emoji); return { content: [{ type: "text", text: "Reacted." }] }; });
+    s.tool("slack_unreact", "Remove a reaction from a message.", { channel: z.string(), timestamp: z.string(), emoji: z.string(), ...profileParam },
+        async ({ channel, timestamp, emoji, profile }) => { await slack.removeReaction(getSlackAuth(profile), channel, timestamp, emoji); return { content: [{ type: "text", text: "Reaction removed." }] }; });
+    s.tool("slack_edit", "Edit a Slack message.", { channel: z.string(), timestamp: z.string(), text: z.string(), ...profileParam },
+        async ({ channel, timestamp, text, profile }) => { await slack.updateMessage(getSlackAuth(profile), channel, timestamp, text); return { content: [{ type: "text", text: "Message updated." }] }; });
+    s.tool("slack_delete", "Delete a Slack message.", { channel: z.string(), timestamp: z.string(), ...profileParam },
+        async ({ channel, timestamp, profile }) => { await slack.deleteMessage(getSlackAuth(profile), channel, timestamp); return { content: [{ type: "text", text: "Deleted." }] }; });
+    s.tool("slack_users", "List Slack workspace users.", { ...profileParam },
+        async ({ profile }) => ({ content: [{ type: "text", text: json(await slack.listUsers(getSlackAuth(profile))) }] }));
+    s.tool("slack_user_profile", "Get a Slack user's profile.", { user_id: z.string(), ...profileParam },
+        async ({ user_id, profile }) => ({ content: [{ type: "text", text: json(await slack.getUserProfile(getSlackAuth(profile), user_id)) }] }));
+    s.tool("slack_set_status", "Set your Slack status.", { text: z.string(), emoji: z.string().optional(), expiration: z.number().optional(), ...profileParam },
+        async ({ text, emoji, expiration, profile }) => { await slack.setStatus(getSlackAuth(profile), text, emoji, expiration); return { content: [{ type: "text", text: "Status set." }] }; });
+    s.tool("slack_create_channel", "Create a Slack channel.", { name: z.string(), is_private: z.boolean().optional(), ...profileParam },
+        async ({ name, is_private, profile }) => ({ content: [{ type: "text", text: json(await slack.createChannel(getSlackAuth(profile), name, is_private)) }] }));
+    s.tool("slack_archive_channel", "Archive a Slack channel.", { channel: z.string(), ...profileParam },
+        async ({ channel, profile }) => { await slack.archiveChannel(getSlackAuth(profile), channel); return { content: [{ type: "text", text: "Archived." }] }; });
+    s.tool("slack_invite", "Invite users to a channel.", { channel: z.string(), user_ids: z.array(z.string()), ...profileParam },
+        async ({ channel, user_ids, profile }) => { await slack.inviteToChannel(getSlackAuth(profile), channel, user_ids); return { content: [{ type: "text", text: "Invited." }] }; });
+    s.tool("slack_kick", "Remove a user from a channel.", { channel: z.string(), user_id: z.string(), ...profileParam },
+        async ({ channel, user_id, profile }) => { await slack.kickFromChannel(getSlackAuth(profile), channel, user_id); return { content: [{ type: "text", text: "Removed." }] }; });
+    s.tool("slack_set_topic", "Set a channel's topic.", { channel: z.string(), topic: z.string(), ...profileParam },
+        async ({ channel, topic, profile }) => { await slack.setChannelTopic(getSlackAuth(profile), channel, topic); return { content: [{ type: "text", text: "Topic set." }] }; });
+    s.tool("slack_set_purpose", "Set a channel's purpose.", { channel: z.string(), purpose: z.string(), ...profileParam },
+        async ({ channel, purpose, profile }) => { await slack.setChannelPurpose(getSlackAuth(profile), channel, purpose); return { content: [{ type: "text", text: "Purpose set." }] }; });
+    s.tool("slack_pin", "Pin a message.", { channel: z.string(), timestamp: z.string(), ...profileParam },
+        async ({ channel, timestamp, profile }) => { await slack.pinMessage(getSlackAuth(profile), channel, timestamp); return { content: [{ type: "text", text: "Pinned." }] }; });
+    s.tool("slack_unpin", "Unpin a message.", { channel: z.string(), timestamp: z.string(), ...profileParam },
+        async ({ channel, timestamp, profile }) => { await slack.unpinMessage(getSlackAuth(profile), channel, timestamp); return { content: [{ type: "text", text: "Unpinned." }] }; });
+    s.tool("slack_pins", "List pinned messages in a channel.", { channel: z.string(), ...profileParam },
+        async ({ channel, profile }) => ({ content: [{ type: "text", text: json(await slack.listPins(getSlackAuth(profile), channel)) }] }));
 
     // Collections
     s.tool("collection_create", "Create a new data collection.", {
