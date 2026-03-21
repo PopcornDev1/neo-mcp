@@ -30,8 +30,13 @@ async function linkedinApi<T = any>(
         for (const [k, v] of Object.entries(options.params)) url.searchParams.set(k, v);
     }
 
+    // csrf-token must be "ajax:{JSESSIONID}" — normalize if needed
+    const csrfToken = auth.jsessionid.startsWith("ajax:")
+        ? auth.jsessionid
+        : `ajax:${auth.jsessionid}`;
+
     const headers: Record<string, string> = {
-        "csrf-token": auth.jsessionid,
+        "csrf-token": csrfToken,
         "x-restli-protocol-version": "2.0.0",
         "x-li-lang": "en_US",
         "Accept": "application/vnd.linkedin.normalized+json+2.1",
@@ -139,36 +144,38 @@ export async function getProfile(auth: LinkedInAuth, vanityName: string): Promis
 
 /** Get the authenticated user's own posts with engagement metrics */
 export async function getMyPosts(auth: LinkedInAuth, count = 20): Promise<any[]> {
-    // Get our member URN to filter to own posts only
     let memberUrn = "";
     try {
         const me = await getMe(auth);
-        memberUrn = me.objectUrn;
+        memberUrn = me.objectUrn || me.entityUrn || "";
     } catch {}
 
-    const params: Record<string, string> = {
-        count: String(count),
-        q: "memberShareFeed",
-        moduleKey: "memberShareFeed",
-        start: "0",
-    };
-    if (memberUrn) params.memberUrn = memberUrn;
+    // GraphQL feed with RECENCY sort to surface own posts first; fetch extra to allow filtering
+    const data = await linkedinApi(auth, `/graphql`, {
+        params: {
+            queryId: "voyagerFeedDashMainFeed.923020905727c01516495a0ac90bb475",
+            variables: `(start:0,count:${count * 3},sortOrder:RECENCY)`,
+        },
+    });
 
-    const data = await linkedinApi(auth, `/feed/updatesV2`, { params });
-    return extractPosts(data, count);
+    const posts = extractGraphQLFeedPosts(data, count * 3);
+    if (memberUrn) {
+        const mine = posts.filter(p => p.authorUrn && p.authorUrn.includes(memberUrn));
+        if (mine.length > 0) return mine.slice(0, count);
+    }
+    return posts.slice(0, count);
 }
 
 /** Get the user's feed */
 export async function getFeed(auth: LinkedInAuth, count = 20): Promise<any[]> {
-    const data = await linkedinApi(auth, `/feed/updatesV2`, {
+    const data = await linkedinApi(auth, `/graphql`, {
         params: {
-            count: String(count),
-            q: "relevance",
-            start: "0",
+            queryId: "voyagerFeedDashMainFeed.923020905727c01516495a0ac90bb475",
+            variables: `(start:0,count:${count},sortOrder:RELEVANCE)`,
         },
     });
 
-    return extractPosts(data, count);
+    return extractGraphQLFeedPosts(data, count);
 }
 
 function extractPosts(data: any, max: number): any[] {
@@ -262,6 +269,81 @@ function extractPosts(data: any, max: number): any[] {
     return posts;
 }
 
+/** Parse the GraphQL feed response (voyagerFeedDashMainFeed GraphQL API) */
+function extractGraphQLFeedPosts(data: any, max: number): any[] {
+    // LinkedIn GraphQL normalized format:
+    //   data.data.feedDashMainFeedByMainFeed.*elements = array of URN strings
+    //   data.data[urn] = the actual FeedComponent entity
+    //   included = referenced profiles, companies, etc.
+    const graphData: Record<string, any> = data?.data?.data || data?.data || {};
+    const included: any[] = data?.included || [];
+
+    // Build URN → entity lookup from URN-keyed top-level keys in graphData
+    const byUrn = new Map<string, any>();
+    for (const [key, value] of Object.entries(graphData)) {
+        if (key.startsWith("urn:")) byUrn.set(key, value);
+    }
+    for (const item of included) {
+        const urn = item.entityUrn || item.urn;
+        if (urn) byUrn.set(urn, item);
+    }
+
+    // Get the ordered list of feed component URNs (or direct element objects)
+    const feedObj: any = graphData["feedDashMainFeedByMainFeed"] || {};
+    const rawElements: any[] = feedObj["*elements"] || feedObj.elements || [];
+
+    const posts: any[] = [];
+
+    for (const raw of rawElements) {
+        if (posts.length >= max) break;
+
+        // Resolve: may be a URN string or an inline object
+        const component: any = typeof raw === "string" ? (byUrn.get(raw) || {}) : raw;
+        if (!component || Object.keys(component).length === 0) continue;
+
+        // Extract text content
+        const commentary =
+            component.commentary?.text?.text ||
+            component.commentary?.text ||
+            component.content?.article?.description?.text ||
+            "";
+        if (!commentary) continue;
+
+        // Extract actor / author
+        const actor: any = component.actor || {};
+        const authorName =
+            actor.name?.text ||
+            actor.title?.text ||
+            `${actor.firstName?.text || ""} ${actor.lastName?.text || ""}`.trim() ||
+            "";
+        const authorUrn = actor.urn || actor["*actor"] || "";
+
+        // Social counts
+        const socialDetail: any = component.socialDetail || component.threadSocialDetail || {};
+        const socialCounts: any = socialDetail.totalSocialActivityCounts || {};
+
+        // Post URN — prefer the activity URN embedded in the feed component
+        const postUrn =
+            component.updateMetadata?.urn ||
+            component.entityUrn ||
+            (typeof raw === "string" ? raw : "");
+
+        posts.push({
+            text: commentary.slice(0, 1000),
+            author: authorName || undefined,
+            authorUrn: authorUrn || undefined,
+            created: component.createdAt ? new Date(component.createdAt).toISOString() : null,
+            likes: socialCounts.numLikes || 0,
+            comments: socialCounts.numComments || 0,
+            reposts: socialCounts.numShares || 0,
+            impressions: socialCounts.numImpressions || null,
+            urn: postUrn,
+        });
+    }
+
+    return posts;
+}
+
 /** Create a text post */
 export async function createPost(auth: LinkedInAuth, text: string): Promise<any> {
     // Get author URN (needed for UGC post format)
@@ -309,12 +391,48 @@ export async function createPost(auth: LinkedInAuth, text: string): Promise<any>
 
 /** Search for people */
 export async function searchPeople(auth: LinkedInAuth, query: string, count = 10): Promise<any[]> {
+    // /search/dash/clusters returns 400 — try typeahead first
+    try {
+        const data = await linkedinApi(auth, `/typeahead/hitsV2`, {
+            params: {
+                q: "people",
+                keywords: query,
+                count: String(count),
+                origin: "GLOBAL_SEARCH_HEADER",
+            },
+        });
+        const hits: any[] = data.elements || data.included || [];
+        const results = hits
+            .filter((e: any) => e.firstName || e.title?.text || e.hitInfo)
+            .slice(0, count)
+            .map((p: any) => {
+                const hit = p.hitInfo?.["com.linkedin.voyager.search.BlendedSearchHit"] || p;
+                const entity = hit.targetPageInstance || hit;
+                return {
+                    name:
+                        p.title?.text ||
+                        entity.title?.text ||
+                        `${entity.firstName || p.firstName || ""} ${entity.lastName || p.lastName || ""}`.trim(),
+                    headline:
+                        p.headline?.text ||
+                        entity.headline?.text ||
+                        p.primarySubtitle?.text ||
+                        "",
+                    publicId: entity.publicIdentifier || p.publicIdentifier || "",
+                    location: p.subline?.text || entity.location?.defaultLocalizedName || "",
+                };
+            })
+            .filter((p: any) => p.name);
+        if (results.length > 0) return results;
+    } catch {}
+
+    // Fallback: original endpoint (may return 400 on some accounts)
     const data = await linkedinApi(auth, `/search/dash/clusters`, {
         params: {
             origin: "GLOBAL_SEARCH_HEADER",
             q: "all",
             keywords: query,
-            "resultType": "PEOPLE",
+            resultType: "PEOPLE",
             count: String(count),
             start: "0",
         },
@@ -451,61 +569,70 @@ export async function getConversations(auth: LinkedInAuth, count = 20): Promise<
 export async function getConversationMessages(auth: LinkedInAuth, conversationId: string, count = 20): Promise<any[]> {
     // conversationId can be:
     //   - Full URL: "https://www.linkedin.com/messaging/thread/2-YWJj..."
-    //   - Full URN: "urn:li:fs_conversation:2-YWJj..."
-    //   - Thread ID: "2-YWJj..." (already just the ID)
-    let convId = conversationId;
+    //   - Full URN: "urn:li:msg_conversation:2-YWJj..." or "urn:li:fs_conversation:..."
+    //   - Thread ID: "2-YWJj..." (bare ID)
+    let convUrn = conversationId;
 
     // Extract from URL
-    if (convId.includes("/messaging/thread/")) {
-        const match = convId.match(/\/thread\/([^/?]+)/);
-        if (match) convId = match[1];
+    if (convUrn.includes("/messaging/thread/")) {
+        const match = convUrn.match(/\/thread\/([^/?]+)/);
+        if (match) convUrn = match[1];
     }
 
-    // Strip known URN prefixes
-    if (convId.startsWith("urn:li:")) {
-        const prefixes = ["urn:li:fs_conversation:", "urn:li:msg_conversation:", "urn:li:messagingThread:"];
-        for (const prefix of prefixes) {
-            if (convId.startsWith(prefix)) {
-                convId = convId.slice(prefix.length);
-                break;
-            }
-        }
+    // Normalize to a full URN for the GraphQL variables string
+    if (!convUrn.startsWith("urn:li:")) {
+        convUrn = `urn:li:msg_conversation:(${convUrn})`;
+    } else if (convUrn.startsWith("urn:li:fs_conversation:")) {
+        // Convert fs_conversation → msg_conversation wrapper
+        const id = convUrn.replace("urn:li:fs_conversation:", "");
+        convUrn = `urn:li:msg_conversation:(${id})`;
+    }
+    // urn:li:msg_conversation:xxx can be passed directly, urn:li:messagingThread:xxx → wrap
+    else if (convUrn.startsWith("urn:li:messagingThread:")) {
+        const id = convUrn.replace("urn:li:messagingThread:", "");
+        convUrn = `urn:li:msg_conversation:(${id})`;
     }
 
-    const data = await linkedinApi(auth, `/messaging/conversations/${encodeURIComponent(convId)}/events`, {
+    const data = await linkedinApi(auth, `/voyagerMessagingGraphQL/graphql`, {
         params: {
-            count: String(count),
-            start: "0",
+            queryId: "messengerMessages.5846eeb71c981f11e0134cb6626cc314",
+            variables: `(conversationUrn:${convUrn})`,
         },
+        headers: { "Accept": "application/graphql" },
     });
 
-    const elements: any[] = data.elements || [];
-    const included: any[] = data.included || [];
-
-    // Build URN lookup for sender profiles
-    const byUrn = new Map<string, any>();
-    for (const item of included) {
-        const urn = item.entityUrn;
-        if (urn) byUrn.set(urn, item);
+    // Walk the GraphQL response tree to find message objects
+    const messages: any[] = [];
+    function findMessages(obj: any, depth: number) {
+        if (!obj || typeof obj !== "object" || depth > 7) return;
+        if (Array.isArray(obj)) { obj.forEach(i => findMessages(i, depth + 1)); return; }
+        // Message objects have body.text and deliveredAt
+        if ((obj.body?.text !== undefined || obj.subject) && obj.deliveredAt !== undefined) {
+            messages.push(obj);
+            return;
+        }
+        if (obj.elements && Array.isArray(obj.elements)) {
+            for (const el of obj.elements) findMessages(el, depth + 1);
+        }
+        for (const k of Object.keys(obj)) {
+            if (typeof obj[k] === "object" && obj[k] !== null) findMessages(obj[k], depth + 1);
+        }
     }
+    findMessages(data, 0);
 
-    return elements.map((evt: any) => {
-        const senderUrn = evt.from?.["*miniProfile"] || evt["*from"] || "";
-        const sender = byUrn.get(senderUrn);
-        const senderName = sender
-            ? `${sender.firstName || ""} ${sender.lastName || ""}`.trim()
-            : senderUrn;
-
-        const body = evt.eventContent?.attributedBody?.text
-            || evt.eventContent?.body
-            || evt.subtype
-            || "";
+    return messages.slice(0, count).map((msg: any) => {
+        const senderMember =
+            msg.sender?.participantType?.member ||
+            msg.actor?.participantType?.member;
+        const senderName = senderMember
+            ? [senderMember.firstName?.text || "", senderMember.lastName?.text || ""].filter(Boolean).join(" ")
+            : "";
 
         return {
-            messageId: evt.entityUrn || "",
+            messageId: msg.entityUrn || msg.backendMessageId || "",
             sender: senderName,
-            body: body.slice(0, 2000),
-            sentAt: evt.createdAt ? new Date(evt.createdAt).toISOString() : null,
+            body: (msg.body?.text || msg.subject || "").slice(0, 2000),
+            sentAt: msg.deliveredAt ? new Date(msg.deliveredAt).toISOString() : null,
         };
     });
 }
@@ -661,22 +788,36 @@ export async function getPostComments(auth: LinkedInAuth, postUrn: string, count
 
 /** Get recent notifications */
 export async function getNotifications(auth: LinkedInAuth, count = 20): Promise<any[]> {
-    const data = await linkedinApi(auth, `/feed/notifications`, {
+    const data = await linkedinApi(auth, `/voyagerIdentityDashNotificationCards`, {
         params: {
+            decorationId: "com.linkedin.voyager.dash.deco.identity.notifications.CardsCollectionWithInjectionsNoPills-24",
             count: String(count),
-            start: "0",
+            q: "filterVanityName",
         },
     });
 
     const elements: any[] = data.elements || [];
 
     return elements.slice(0, count).map((n: any) => ({
-        headline: n.headline?.text || n.headline || "",
-        description: n.additionalDescription?.text || n.description?.text || "",
-        type: n.trackingData?.notificationType || n.notificationType || "",
+        headline:
+            n.headline?.text ||
+            n.headlineText?.text ||
+            n.notificationText?.text ||
+            n.headline ||
+            "",
+        description:
+            n.subText?.text ||
+            n.additionalDescription?.text ||
+            n.description?.text ||
+            "",
+        type: n.notificationType || n.trackingData?.notificationType || n.type || "",
         read: !!n.read,
         createdAt: n.publishedAt ? new Date(n.publishedAt).toISOString() : null,
-        actionUrl: n.navigationUrl || n.cta?.navigationUrl || "",
+        actionUrl:
+            n.navigationUrl ||
+            n.cta?.navigationUrl ||
+            n.actions?.[0]?.actionTarget ||
+            "",
     }));
 }
 
