@@ -290,3 +290,347 @@ export async function getConnections(auth: LinkedInAuth, count = 50): Promise<an
             publicId: c.publicIdentifier || "",
         }));
 }
+
+// ── Messaging ────────────────────────────────────────────────────────────────
+
+/** List recent message conversations */
+export async function getConversations(auth: LinkedInAuth, count = 20): Promise<any[]> {
+    const data = await linkedinApi(auth, `/messaging/conversations`, {
+        params: {
+            keyVersion: "LEGACY_INBOX",
+            count: String(count),
+            start: "0",
+        },
+    });
+
+    const included: any[] = data.included || [];
+    const elements: any[] = data.elements || [];
+
+    // Build URN lookup for participant mini-profiles
+    const byUrn = new Map<string, any>();
+    for (const item of included) {
+        const urn = item.entityUrn || item["*miniProfile"];
+        if (urn) byUrn.set(urn, item);
+    }
+
+    return elements.slice(0, count).map((conv: any) => {
+        // Extract participant names from included mini-profiles
+        const participantUrns: string[] = conv["*participants"] || [];
+        const participants = participantUrns.map((pUrn: string) => {
+            const participant = byUrn.get(pUrn);
+            if (!participant) return pUrn;
+            const mp = participant.miniProfile || participant["*miniProfile"];
+            const profile = mp ? (typeof mp === "string" ? byUrn.get(mp) : mp) : participant;
+            if (profile?.firstName) return `${profile.firstName} ${profile.lastName || ""}`.trim();
+            return participant.firstName ? `${participant.firstName} ${participant.lastName || ""}`.trim() : pUrn;
+        });
+
+        const lastEvent = conv.events?.[0] || {};
+        const msgBody = lastEvent.eventContent?.attributedBody?.text
+            || lastEvent.eventContent?.body
+            || lastEvent.subtype
+            || "";
+
+        return {
+            conversationId: conv.entityUrn || conv.backendConversationUrn || "",
+            participants,
+            lastMessage: msgBody.slice(0, 300),
+            lastActivityAt: conv.lastActivityAt ? new Date(conv.lastActivityAt).toISOString() : null,
+            unreadCount: conv.unreadCount || 0,
+        };
+    });
+}
+
+/** Get messages in a specific conversation */
+export async function getConversationMessages(auth: LinkedInAuth, conversationId: string, count = 20): Promise<any[]> {
+    // conversationId might be a full URN or just the ID — extract the ID part
+    const convId = conversationId.includes(",") ? conversationId : conversationId.replace(/.*:/, "");
+
+    const data = await linkedinApi(auth, `/messaging/conversations/${encodeURIComponent(convId)}/events`, {
+        params: {
+            count: String(count),
+            start: "0",
+        },
+    });
+
+    const elements: any[] = data.elements || [];
+    const included: any[] = data.included || [];
+
+    // Build URN lookup for sender profiles
+    const byUrn = new Map<string, any>();
+    for (const item of included) {
+        const urn = item.entityUrn;
+        if (urn) byUrn.set(urn, item);
+    }
+
+    return elements.map((evt: any) => {
+        const senderUrn = evt.from?.["*miniProfile"] || evt["*from"] || "";
+        const sender = byUrn.get(senderUrn);
+        const senderName = sender
+            ? `${sender.firstName || ""} ${sender.lastName || ""}`.trim()
+            : senderUrn;
+
+        const body = evt.eventContent?.attributedBody?.text
+            || evt.eventContent?.body
+            || evt.subtype
+            || "";
+
+        return {
+            messageId: evt.entityUrn || "",
+            sender: senderName,
+            body: body.slice(0, 2000),
+            sentAt: evt.createdAt ? new Date(evt.createdAt).toISOString() : null,
+        };
+    });
+}
+
+/** Send a message to a LinkedIn member */
+export async function sendMessage(auth: LinkedInAuth, recipientUrn: string, body: string): Promise<any> {
+    // recipientUrn should be like "urn:li:fsd_profile:ACoAAA..." or "urn:li:member:12345"
+    // If a vanity name is passed, we need to resolve it first
+    let targetUrn = recipientUrn;
+    if (!targetUrn.startsWith("urn:")) {
+        // Assume it's a vanity name — resolve to profile URN
+        const profile = await getProfile(auth, targetUrn);
+        if (!profile.publicId) throw new Error(`Could not resolve recipient "${recipientUrn}"`);
+        // We need the member URN; fetch via the profile data
+        const data = await linkedinApi(auth, `/identity/dash/profiles`, {
+            params: { q: "memberIdentity", memberIdentity: targetUrn },
+        });
+        const included: any[] = data.included || [];
+        const profileEntity = included.find((e: any) => e.$type?.includes("Profile") && e.entityUrn);
+        if (profileEntity?.entityUrn) {
+            targetUrn = profileEntity.entityUrn;
+        } else {
+            throw new Error(`Could not resolve member URN for "${recipientUrn}"`);
+        }
+    }
+
+    const me = await getMe(auth);
+    const senderUrn = me.entityUrn || me.objectUrn;
+
+    const msgBody = {
+        keyVersion: "LEGACY_INBOX",
+        conversationCreate: {
+            recipients: [targetUrn],
+            subtype: "MEMBER_TO_MEMBER",
+            eventCreate: {
+                value: {
+                    "com.linkedin.voyager.messaging.create.MessageCreate": {
+                        attributedBody: {
+                            text: body,
+                            attributes: [],
+                        },
+                    },
+                },
+            },
+        },
+    };
+
+    const data = await linkedinApi(auth, `/messaging/conversations`, {
+        method: "POST",
+        body: msgBody,
+    });
+
+    return { sent: true, conversationUrn: data.value?.entityUrn || data.entityUrn || null };
+}
+
+// ── Reactions & Comments ─────────────────────────────────────────────────────
+
+/** React to a post (like, celebrate, support, love, insightful, funny) */
+export async function reactToPost(auth: LinkedInAuth, postUrn: string, reactionType: string = "LIKE"): Promise<any> {
+    // Normalize the URN — accept update URN or activity URN
+    let activityUrn = postUrn;
+    if (postUrn.includes("ugcPost")) {
+        activityUrn = postUrn;
+    } else if (postUrn.includes("activity")) {
+        activityUrn = postUrn;
+    }
+
+    const data = await linkedinApi(auth, `/feed/reactions`, {
+        method: "POST",
+        body: {
+            reactionType: reactionType.toUpperCase(),
+            reactionsUrn: activityUrn,
+        },
+    });
+
+    return { reacted: true, type: reactionType.toUpperCase(), postUrn: activityUrn };
+}
+
+/** Comment on a post */
+export async function commentOnPost(auth: LinkedInAuth, postUrn: string, text: string): Promise<any> {
+    let authorUrn = "";
+    try {
+        const me = await getMe(auth);
+        authorUrn = me.objectUrn.replace("urn:li:member:", "urn:li:person:");
+    } catch {}
+
+    const body: any = {
+        threadUrn: postUrn,
+        commentary: {
+            text,
+            attributes: [],
+        },
+    };
+    if (authorUrn) body.author = authorUrn;
+
+    const data = await linkedinApi(auth, `/feed/normComments`, {
+        method: "POST",
+        body,
+    });
+
+    return { commented: true, urn: data.urn || data.value?.urn || null };
+}
+
+/** Get comments on a post */
+export async function getPostComments(auth: LinkedInAuth, postUrn: string, count = 20): Promise<any[]> {
+    const data = await linkedinApi(auth, `/feed/comments`, {
+        params: {
+            q: "comments",
+            updateUrn: postUrn,
+            count: String(count),
+            start: "0",
+            sortOrder: "RELEVANCE",
+        },
+    });
+
+    const included: any[] = data.included || [];
+    const elements: any[] = data.elements || included;
+
+    // Build URN map for author lookup
+    const byUrn = new Map<string, any>();
+    for (const item of included) {
+        const urn = item.entityUrn;
+        if (urn) byUrn.set(urn, item);
+    }
+
+    return elements
+        .filter((e: any) => e.commentary || e.comment || e.message)
+        .slice(0, count)
+        .map((c: any) => {
+            const commentText = c.commentary?.text?.text
+                || c.commentary?.text
+                || c.comment?.values?.[0]?.value
+                || c.message?.text
+                || "";
+
+            // Resolve author
+            const authorRef = c["*commenter"] || c["*author"] || c.commenter;
+            const author = authorRef ? byUrn.get(authorRef) : null;
+            const authorName = author
+                ? `${author.firstName || ""} ${author.lastName || ""}`.trim()
+                : "";
+
+            return {
+                text: commentText.slice(0, 500),
+                author: authorName,
+                likes: c.numLikes || c.socialDetail?.totalSocialActivityCounts?.numLikes || 0,
+                created: c.createdAt ? new Date(c.createdAt).toISOString() : null,
+                urn: c.entityUrn || "",
+            };
+        });
+}
+
+// ── Notifications ────────────────────────────────────────────────────────────
+
+/** Get recent notifications */
+export async function getNotifications(auth: LinkedInAuth, count = 20): Promise<any[]> {
+    const data = await linkedinApi(auth, `/feed/notifications`, {
+        params: {
+            count: String(count),
+            start: "0",
+        },
+    });
+
+    const elements: any[] = data.elements || [];
+    const included: any[] = data.included || [];
+
+    return elements.slice(0, count).map((n: any) => ({
+        headline: n.headline?.text || n.headline || "",
+        description: n.additionalDescription?.text || n.description?.text || "",
+        type: n.trackingData?.notificationType || n.notificationType || "",
+        read: !!n.read,
+        createdAt: n.publishedAt ? new Date(n.publishedAt).toISOString() : null,
+        actionUrl: n.navigationUrl || n.cta?.navigationUrl || "",
+    }));
+}
+
+// ── Connection Requests ──────────────────────────────────────────────────────
+
+/** Send a connection request */
+export async function sendConnectionRequest(auth: LinkedInAuth, vanityName: string, message?: string): Promise<any> {
+    // Resolve vanity name to a profile URN
+    const data = await linkedinApi(auth, `/identity/dash/profiles`, {
+        params: { q: "memberIdentity", memberIdentity: vanityName },
+    });
+    const included: any[] = data.included || [];
+    const profileEntity = included.find((e: any) => e.$type?.includes("Profile") && e.entityUrn);
+    if (!profileEntity?.entityUrn) throw new Error(`Could not find profile for "${vanityName}"`);
+
+    const targetUrn = profileEntity.entityUrn;
+
+    const body: any = {
+        inviteeProfileUrn: targetUrn,
+    };
+    if (message) {
+        body.customMessage = message;
+    }
+
+    const result = await linkedinApi(auth, `/relationships/invitations`, {
+        method: "POST",
+        body,
+    });
+
+    return { sent: true, to: vanityName };
+}
+
+/** Get pending connection requests (received) */
+export async function getInvitations(auth: LinkedInAuth, count = 20): Promise<any[]> {
+    const data = await linkedinApi(auth, `/relationships/invitationViews`, {
+        params: {
+            count: String(count),
+            start: "0",
+            q: "receivedInvitation",
+        },
+    });
+
+    const included: any[] = data.included || [];
+    const elements: any[] = data.elements || [];
+
+    // Build URN map
+    const byUrn = new Map<string, any>();
+    for (const item of included) {
+        const urn = item.entityUrn;
+        if (urn) byUrn.set(urn, item);
+    }
+
+    return elements.slice(0, count).map((inv: any) => {
+        const fromRef = inv["*fromMember"] || inv["*genericInviter"];
+        const from = fromRef ? byUrn.get(fromRef) : null;
+        const fromName = from
+            ? `${from.firstName || ""} ${from.lastName || ""}`.trim()
+            : "";
+
+        return {
+            invitationId: inv.entityUrn || "",
+            from: fromName,
+            headline: from?.headline || from?.occupation || "",
+            message: inv.message || "",
+            sentAt: inv.sentTime ? new Date(inv.sentTime).toISOString() : null,
+        };
+    });
+}
+
+/** Accept or decline a connection request */
+export async function respondToInvitation(auth: LinkedInAuth, invitationId: string, accept: boolean): Promise<any> {
+    // invitationId might be a full URN — extract the numeric part
+    const id = invitationId.replace(/.*:/, "");
+    const action = accept ? "accept" : "ignore";
+
+    await linkedinApi(auth, `/relationships/invitations/${id}/${action}`, {
+        method: "POST",
+    });
+
+    return { [action]: true, invitationId: id };
+}

@@ -303,6 +303,106 @@ server.tool(
     }
 );
 
+server.tool(
+    "linkedin_conversations",
+    "List your recent LinkedIn message conversations.",
+    { count: z.number().optional().describe("Number of conversations (default 20)"), ...profileParam },
+    async ({ count, profile }) => {
+        const results = await linkedin.getConversations(getLinkedInAuth(profile), count || 20);
+        return { content: [{ type: "text", text: json(results) }] };
+    }
+);
+
+server.tool(
+    "linkedin_messages",
+    "Get messages in a specific LinkedIn conversation. Pass the conversationId from linkedin_conversations.",
+    { conversation_id: z.string().describe("Conversation ID or URN from linkedin_conversations"), count: z.number().optional(), ...profileParam },
+    async ({ conversation_id, count, profile }) => {
+        const results = await linkedin.getConversationMessages(getLinkedInAuth(profile), conversation_id, count || 20);
+        return { content: [{ type: "text", text: json(results) }] };
+    }
+);
+
+server.tool(
+    "linkedin_send_message",
+    "Send a LinkedIn message to a connection. Pass their profile URN or vanity name (URL slug).",
+    { recipient: z.string().describe("Recipient's vanity name or member URN"), message: z.string().describe("Message text"), ...profileParam },
+    async ({ recipient, message, profile }) => {
+        const result = await linkedin.sendMessage(getLinkedInAuth(profile), recipient, message);
+        return { content: [{ type: "text", text: json(result) }] };
+    }
+);
+
+server.tool(
+    "linkedin_react",
+    "React to a LinkedIn post (like, celebrate, support, love, insightful, funny).",
+    { post_urn: z.string().describe("Post URN from linkedin_feed or linkedin_my_posts"), reaction: z.enum(["LIKE", "CELEBRATE", "SUPPORT", "LOVE", "INSIGHTFUL", "FUNNY"]).optional().describe("Reaction type (default LIKE)"), ...profileParam },
+    async ({ post_urn, reaction, profile }) => {
+        const result = await linkedin.reactToPost(getLinkedInAuth(profile), post_urn, reaction || "LIKE");
+        return { content: [{ type: "text", text: json(result) }] };
+    }
+);
+
+server.tool(
+    "linkedin_comment",
+    "Comment on a LinkedIn post.",
+    { post_urn: z.string().describe("Post URN"), text: z.string().describe("Comment text"), ...profileParam },
+    async ({ post_urn, text, profile }) => {
+        const result = await linkedin.commentOnPost(getLinkedInAuth(profile), post_urn, text);
+        return { content: [{ type: "text", text: json(result) }] };
+    }
+);
+
+server.tool(
+    "linkedin_post_comments",
+    "Get comments on a LinkedIn post.",
+    { post_urn: z.string().describe("Post URN"), count: z.number().optional(), ...profileParam },
+    async ({ post_urn, count, profile }) => {
+        const results = await linkedin.getPostComments(getLinkedInAuth(profile), post_urn, count || 20);
+        return { content: [{ type: "text", text: json(results) }] };
+    }
+);
+
+server.tool(
+    "linkedin_notifications",
+    "Get your recent LinkedIn notifications.",
+    { count: z.number().optional().describe("Number of notifications (default 20)"), ...profileParam },
+    async ({ count, profile }) => {
+        const results = await linkedin.getNotifications(getLinkedInAuth(profile), count || 20);
+        return { content: [{ type: "text", text: json(results) }] };
+    }
+);
+
+server.tool(
+    "linkedin_send_connection",
+    "Send a connection request to a LinkedIn user.",
+    { vanity_name: z.string().describe("Recipient's vanity name (URL slug)"), message: z.string().optional().describe("Optional personalized message"), ...profileParam },
+    async ({ vanity_name, message, profile }) => {
+        const result = await linkedin.sendConnectionRequest(getLinkedInAuth(profile), vanity_name, message);
+        return { content: [{ type: "text", text: json(result) }] };
+    }
+);
+
+server.tool(
+    "linkedin_invitations",
+    "Get your pending connection requests (received).",
+    { count: z.number().optional(), ...profileParam },
+    async ({ count, profile }) => {
+        const results = await linkedin.getInvitations(getLinkedInAuth(profile), count || 20);
+        return { content: [{ type: "text", text: json(results) }] };
+    }
+);
+
+server.tool(
+    "linkedin_respond_invitation",
+    "Accept or decline a pending connection request.",
+    { invitation_id: z.string().describe("Invitation ID or URN from linkedin_invitations"), accept: z.boolean().describe("true to accept, false to decline"), ...profileParam },
+    async ({ invitation_id, accept, profile }) => {
+        const result = await linkedin.respondToInvitation(getLinkedInAuth(profile), invitation_id, accept);
+        return { content: [{ type: "text", text: json(result) }] };
+    }
+);
+
 // ── Twitter/X ────────────────────────────────────────────────────────────────
 
 server.tool(
@@ -1050,6 +1150,26 @@ function registerAllTools(s: McpServer) {
         async ({ query, count, profile }) => ({ content: [{ type: "text", text: json(await linkedin.searchPeople(getLinkedInAuth(profile), query, count || 10)) }] }));
     s.tool("linkedin_connections", "List your LinkedIn connections.", { count: z.number().optional(), ...profileParam },
         async ({ count, profile }) => ({ content: [{ type: "text", text: json(await linkedin.getConnections(getLinkedInAuth(profile), count || 50)) }] }));
+    s.tool("linkedin_conversations", "List your recent LinkedIn message conversations.", { count: z.number().optional(), ...profileParam },
+        async ({ count, profile }) => ({ content: [{ type: "text", text: json(await linkedin.getConversations(getLinkedInAuth(profile), count || 20)) }] }));
+    s.tool("linkedin_messages", "Get messages in a specific LinkedIn conversation.", { conversation_id: z.string(), count: z.number().optional(), ...profileParam },
+        async ({ conversation_id, count, profile }) => ({ content: [{ type: "text", text: json(await linkedin.getConversationMessages(getLinkedInAuth(profile), conversation_id, count || 20)) }] }));
+    s.tool("linkedin_send_message", "Send a LinkedIn message.", { recipient: z.string(), message: z.string(), ...profileParam },
+        async ({ recipient, message, profile }) => ({ content: [{ type: "text", text: json(await linkedin.sendMessage(getLinkedInAuth(profile), recipient, message)) }] }));
+    s.tool("linkedin_react", "React to a LinkedIn post.", { post_urn: z.string(), reaction: z.enum(["LIKE", "CELEBRATE", "SUPPORT", "LOVE", "INSIGHTFUL", "FUNNY"]).optional(), ...profileParam },
+        async ({ post_urn, reaction, profile }) => ({ content: [{ type: "text", text: json(await linkedin.reactToPost(getLinkedInAuth(profile), post_urn, reaction || "LIKE")) }] }));
+    s.tool("linkedin_comment", "Comment on a LinkedIn post.", { post_urn: z.string(), text: z.string(), ...profileParam },
+        async ({ post_urn, text, profile }) => ({ content: [{ type: "text", text: json(await linkedin.commentOnPost(getLinkedInAuth(profile), post_urn, text)) }] }));
+    s.tool("linkedin_post_comments", "Get comments on a LinkedIn post.", { post_urn: z.string(), count: z.number().optional(), ...profileParam },
+        async ({ post_urn, count, profile }) => ({ content: [{ type: "text", text: json(await linkedin.getPostComments(getLinkedInAuth(profile), post_urn, count || 20)) }] }));
+    s.tool("linkedin_notifications", "Get your recent LinkedIn notifications.", { count: z.number().optional(), ...profileParam },
+        async ({ count, profile }) => ({ content: [{ type: "text", text: json(await linkedin.getNotifications(getLinkedInAuth(profile), count || 20)) }] }));
+    s.tool("linkedin_send_connection", "Send a connection request.", { vanity_name: z.string(), message: z.string().optional(), ...profileParam },
+        async ({ vanity_name, message, profile }) => ({ content: [{ type: "text", text: json(await linkedin.sendConnectionRequest(getLinkedInAuth(profile), vanity_name, message)) }] }));
+    s.tool("linkedin_invitations", "Get pending connection requests.", { count: z.number().optional(), ...profileParam },
+        async ({ count, profile }) => ({ content: [{ type: "text", text: json(await linkedin.getInvitations(getLinkedInAuth(profile), count || 20)) }] }));
+    s.tool("linkedin_respond_invitation", "Accept or decline a connection request.", { invitation_id: z.string(), accept: z.boolean(), ...profileParam },
+        async ({ invitation_id, accept, profile }) => ({ content: [{ type: "text", text: json(await linkedin.respondToInvitation(getLinkedInAuth(profile), invitation_id, accept)) }] }));
 
     // Twitter
     s.tool("twitter_profile", "Get a Twitter/X user's profile.", { screen_name: z.string(), ...profileParam },
