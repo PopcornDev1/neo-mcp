@@ -1209,7 +1209,7 @@ async function main() {
     // ── Gmail OAuth ──────────────────────────────────────────────────────
     app.get("/gmail/auth", (req: any, res: any) => {
         const profile = req.query.profile || undefined;
-        const redirectUri = `http://127.0.0.1:${httpPort}/gmail/callback`;
+        const redirectUri = `http://localhost:${httpPort}/gmail/callback`;
         const url = gmail.getOAuthUrl(redirectUri, profile);
         res.redirect(url);
     });
@@ -1219,7 +1219,7 @@ async function main() {
         const profile = (req.query.state as string) || "default";
         if (!code) { res.status(400).send("Missing authorization code."); return; }
         try {
-            const redirectUri = `http://127.0.0.1:${httpPort}/gmail/callback`;
+            const redirectUri = `http://localhost:${httpPort}/gmail/callback`;
             const tokens = await gmail.exchangeCode(code, redirectUri);
             const storageKey = profileKey("gmail", profile === "default" ? undefined : profile);
             const creds: Record<string, string> = { refresh_token: tokens.refresh_token };
