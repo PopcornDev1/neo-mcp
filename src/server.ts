@@ -22,6 +22,7 @@ import * as slack from "./integrations/slack.js";
 import * as gmail from "./integrations/gmail.js";
 import * as github from "./integrations/github.js";
 import * as gcal from "./integrations/gcal.js";
+import * as notion from "./integrations/notion.js";
 import * as db from "./db.js";
 import { browserCommand, startBridge, isBridgeConnected } from "./bridge.js";
 
@@ -32,6 +33,7 @@ const NEO_INSTRUCTIONS = `Neo is a browser bridge that lets you operate the user
 - Twitter/X: extract_auth("twitter") once, then use twitter_* tools
 - GitHub: extract_auth("github") once, then use github_* tools (repos, issues, PRs, actions, gists, search)
 - Google Calendar: gcal_connect (OAuth sign-in, then use gcal_* tools for events, scheduling, free/busy)
+- Notion: extract_auth("notion") once, then use notion_* tools (pages, databases, search, create/edit)
 - Slack: extract_auth("slack") once, then use slack_* tools
 - Gmail: gmail_connect (OAuth sign-in, supports multiple accounts via profile param)
 - WhatsApp: whatsapp_connect (QR code first time, auto-reconnects after)
@@ -134,6 +136,13 @@ async function getGCalAuth(profile?: string): Promise<gcal.GCalAuth> {
     if (!creds.refresh_token) throw new Error(`Google Calendar not connected${profile ? ` for profile "${profile}"` : ""}. Use gcal_connect to authenticate.`);
     const access_token = await gcal.refreshAccessToken(creds.refresh_token, profile || "default");
     return { access_token };
+}
+
+function getNotionAuth(profile?: string): notion.NotionAuth {
+    const creds = getAuth(profileKey("notion", profile));
+    const token = creds.token_v2 || "";
+    if (!token && !creds._cookies) throw new Error(`Missing token_v2. Run extract_auth for notion${profile ? ` (profile: ${profile})` : ""}.`);
+    return { token_v2: token, _cookies: creds._cookies };
 }
 
 function getGitHubAuth(profile?: string): github.GitHubAuth {
@@ -632,6 +641,31 @@ server.tool("gcal_freebusy", "Check free/busy status for calendars.", {
 }, async ({ calendar_ids, time_min, time_max, profile }) => ({
     content: [{ type: "text", text: json(await gcal.freeBusy(await getGCalAuth(profile), calendar_ids || ["primary"], time_min, time_max)) }],
 }));
+
+// ── Notion ─────────────────────────────────────────────────────────────────────
+
+server.tool("notion_spaces", "List your Notion workspaces.", { ...profileParam },
+    async ({ profile }) => ({ content: [{ type: "text", text: json(await notion.getSpaces(getNotionAuth(profile))) }] }));
+server.tool("notion_search", "Search Notion pages and databases.", { query: z.string(), limit: z.number().optional(), type: z.string().optional().describe("Filter type: page, collection, etc."), ...profileParam },
+    async ({ query, limit, type, profile }) => ({ content: [{ type: "text", text: json(await notion.search(getNotionAuth(profile), query, { limit, type })) }] }));
+server.tool("notion_page", "Get a Notion page with its child blocks.", { page_id: z.string().describe("Page ID, UUID, or Notion URL"), ...profileParam },
+    async ({ page_id, profile }) => ({ content: [{ type: "text", text: json(await notion.getPage(getNotionAuth(profile), page_id)) }] }));
+server.tool("notion_page_content", "Get a Notion page's content as readable markdown text.", { page_id: z.string().describe("Page ID, UUID, or Notion URL"), ...profileParam },
+    async ({ page_id, profile }) => ({ content: [{ type: "text", text: await notion.getPageContent(getNotionAuth(profile), page_id) }] }));
+server.tool("notion_block", "Get a specific Notion block.", { block_id: z.string(), ...profileParam },
+    async ({ block_id, profile }) => ({ content: [{ type: "text", text: json(await notion.getBlock(getNotionAuth(profile), block_id)) }] }));
+server.tool("notion_create_page", "Create a new Notion page.", { parent_id: z.string().describe("Parent page ID or URL"), title: z.string(), content: z.string().optional().describe("Initial text content (one paragraph per line)"), ...profileParam },
+    async ({ parent_id, title, content, profile }) => ({ content: [{ type: "text", text: json(await notion.createPage(getNotionAuth(profile), parent_id, title, content)) }] }));
+server.tool("notion_append", "Append a block to a Notion page.", { page_id: z.string(), text: z.string(), type: z.enum(["text", "header", "sub_header", "bulleted_list", "numbered_list", "to_do", "toggle", "quote", "code", "divider"]).optional(), ...profileParam },
+    async ({ page_id, text, type, profile }) => ({ content: [{ type: "text", text: json(await notion.appendBlock(getNotionAuth(profile), page_id, text, type || "text")) }] }));
+server.tool("notion_update_block", "Update the text of a Notion block.", { block_id: z.string(), text: z.string(), ...profileParam },
+    async ({ block_id, text, profile }) => ({ content: [{ type: "text", text: json(await notion.updateBlock(getNotionAuth(profile), block_id, text)) }] }));
+server.tool("notion_delete_block", "Delete a Notion block.", { block_id: z.string(), ...profileParam },
+    async ({ block_id, profile }) => { await notion.deleteBlock(getNotionAuth(profile), block_id); return { content: [{ type: "text", text: "Block deleted." }] }; });
+server.tool("notion_database", "Query a Notion database (collection).", { collection_id: z.string(), view_id: z.string(), limit: z.number().optional(), query: z.string().optional(), ...profileParam },
+    async ({ collection_id, view_id, limit, query, profile }) => ({ content: [{ type: "text", text: json(await notion.queryDatabase(getNotionAuth(profile), collection_id, view_id, { limit, query })) }] }));
+server.tool("notion_recent", "Get your recently visited Notion pages.", { limit: z.number().optional(), ...profileParam },
+    async ({ limit, profile }) => ({ content: [{ type: "text", text: json(await notion.getRecentPages(getNotionAuth(profile), limit || 20)) }] }));
 
 // ── Collections (agent-designed data storage) ────────────────────────────────
 
@@ -1389,6 +1423,7 @@ async function main() {
     linkedin.setBrowserCommand(browserCommand);
     twitter.setBrowserCommand(browserCommand);
     github.setBrowserCommand(browserCommand);
+    notion.setBrowserCommand(browserCommand);
 
     // Load and register all saved custom tools (graceful — db may fail on Linux VM)
     try {
@@ -1778,6 +1813,30 @@ function registerAllTools(s: McpServer) {
         async ({ text, calendar_id, profile }) => ({ content: [{ type: "text", text: json(await gcal.quickAddEvent(await getGCalAuth(profile), calendar_id || "primary", text)) }] }));
     s.tool("gcal_freebusy", "Check free/busy status for calendars.", { calendar_ids: z.array(z.string()).optional(), time_min: z.string(), time_max: z.string(), ...profileParam },
         async ({ calendar_ids, time_min, time_max, profile }) => ({ content: [{ type: "text", text: json(await gcal.freeBusy(await getGCalAuth(profile), calendar_ids || ["primary"], time_min, time_max)) }] }));
+
+    // Notion
+    s.tool("notion_spaces", "List your Notion workspaces.", { ...profileParam },
+        async ({ profile }) => ({ content: [{ type: "text", text: json(await notion.getSpaces(getNotionAuth(profile))) }] }));
+    s.tool("notion_search", "Search Notion pages and databases.", { query: z.string(), limit: z.number().optional(), type: z.string().optional(), ...profileParam },
+        async ({ query, limit, type, profile }) => ({ content: [{ type: "text", text: json(await notion.search(getNotionAuth(profile), query, { limit, type })) }] }));
+    s.tool("notion_page", "Get a Notion page with its child blocks.", { page_id: z.string(), ...profileParam },
+        async ({ page_id, profile }) => ({ content: [{ type: "text", text: json(await notion.getPage(getNotionAuth(profile), page_id)) }] }));
+    s.tool("notion_page_content", "Get a Notion page's content as readable markdown.", { page_id: z.string(), ...profileParam },
+        async ({ page_id, profile }) => ({ content: [{ type: "text", text: await notion.getPageContent(getNotionAuth(profile), page_id) }] }));
+    s.tool("notion_block", "Get a specific Notion block.", { block_id: z.string(), ...profileParam },
+        async ({ block_id, profile }) => ({ content: [{ type: "text", text: json(await notion.getBlock(getNotionAuth(profile), block_id)) }] }));
+    s.tool("notion_create_page", "Create a new Notion page.", { parent_id: z.string(), title: z.string(), content: z.string().optional(), ...profileParam },
+        async ({ parent_id, title, content, profile }) => ({ content: [{ type: "text", text: json(await notion.createPage(getNotionAuth(profile), parent_id, title, content)) }] }));
+    s.tool("notion_append", "Append a block to a Notion page.", { page_id: z.string(), text: z.string(), type: z.enum(["text", "header", "sub_header", "bulleted_list", "numbered_list", "to_do", "toggle", "quote", "code", "divider"]).optional(), ...profileParam },
+        async ({ page_id, text, type, profile }) => ({ content: [{ type: "text", text: json(await notion.appendBlock(getNotionAuth(profile), page_id, text, type || "text")) }] }));
+    s.tool("notion_update_block", "Update the text of a Notion block.", { block_id: z.string(), text: z.string(), ...profileParam },
+        async ({ block_id, text, profile }) => ({ content: [{ type: "text", text: json(await notion.updateBlock(getNotionAuth(profile), block_id, text)) }] }));
+    s.tool("notion_delete_block", "Delete a Notion block.", { block_id: z.string(), ...profileParam },
+        async ({ block_id, profile }) => { await notion.deleteBlock(getNotionAuth(profile), block_id); return { content: [{ type: "text", text: "Block deleted." }] }; });
+    s.tool("notion_database", "Query a Notion database.", { collection_id: z.string(), view_id: z.string(), limit: z.number().optional(), query: z.string().optional(), ...profileParam },
+        async ({ collection_id, view_id, limit, query, profile }) => ({ content: [{ type: "text", text: json(await notion.queryDatabase(getNotionAuth(profile), collection_id, view_id, { limit, query })) }] }));
+    s.tool("notion_recent", "Get recently visited Notion pages.", { limit: z.number().optional(), ...profileParam },
+        async ({ limit, profile }) => ({ content: [{ type: "text", text: json(await notion.getRecentPages(getNotionAuth(profile), limit || 20)) }] }));
 
     // Slack
     s.tool("slack_channels", "List Slack channels.", { ...profileParam },
