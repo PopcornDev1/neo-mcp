@@ -1,14 +1,105 @@
 # Neo MCP
 
-MCP server that gives Claude access to your real accounts — LinkedIn, Twitter/X, WhatsApp, and any website you're logged into. No API keys. No OAuth. It grabs auth tokens straight from your browser.
+Give Claude access to your real accounts — LinkedIn, Twitter/X, WhatsApp, and any website you're logged into. No API keys. No OAuth. Neo grabs auth tokens straight from your browser.
 
-The AI can also build its own integrations at runtime for any service you use.
+Claude can also build its own integrations at runtime for any service you use.
 
-## Install
+---
 
-### 1. Add to Claude Desktop
+## Quick Start
 
-Add to your Claude Desktop MCP config (`Settings > Developer > Edit Config`):
+There are two pieces to install: the **MCP server** (talks to Claude) and the **Chrome extension** (talks to your browser).
+
+### Step 1: Install the Chrome Extension
+
+This is required for both transport modes — it's how Neo accesses your browser sessions.
+
+1. Clone the repo:
+   ```bash
+   git clone https://github.com/heydryft/neo-mcp.git
+   cd neo-mcp
+   ```
+2. Open `chrome://extensions` in Chrome
+3. Turn on **Developer mode** (top-right toggle)
+4. Click **Load unpacked** → select the `extension/` folder from the cloned repo
+
+You'll see the **Neo Bridge** icon in your toolbar.
+
+### Step 2: Choose your transport
+
+Pick one based on how you use Claude:
+
+| | HTTP Server (recommended) | Stdio |
+|---|---|---|
+| **Best for** | Cowork, Claude Code, multiple clients | Claude Desktop (simple setup) |
+| **How it runs** | Long-running process on your machine | Claude Desktop manages the process |
+| **Supports multiple clients** | Yes | No (one session at a time) |
+| **Setup effort** | Run one command | Edit a JSON config |
+
+---
+
+## Option A: HTTP Server (recommended)
+
+The HTTP server runs on your machine and exposes an MCP endpoint that any client can connect to.
+
+### 1. Build and start the server
+
+```bash
+cd neo-mcp
+npm install
+npm run build
+npm run start:http
+```
+
+The server starts at `http://localhost:3100/mcp`.
+
+To use a different port:
+
+```bash
+NEO_HTTP_PORT=4000 npm run start:http
+```
+
+### 2. Connect your client
+
+#### Claude Desktop
+
+Go to `Settings > Developer > Edit Config` and add:
+
+```json
+{
+  "mcpServers": {
+    "neo": {
+      "url": "http://localhost:3100/mcp"
+    }
+  }
+}
+```
+
+Restart Claude Desktop.
+
+#### Claude Code
+
+```bash
+claude mcp add neo --transport http http://localhost:3100/mcp
+```
+
+#### Cowork
+
+Cowork runs in a sandboxed Linux VM on your machine. The server must run on your **host machine** (not inside the VM) because it needs access to the Chrome extension and local database.
+
+Add Neo as a remote MCP server in your Cowork config pointing to `http://localhost:3100/mcp`.
+
+#### Any MCP client
+
+Point it at `http://localhost:3100/mcp` — it speaks [Streamable HTTP](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#streamable-http).
+
+---
+
+## Option B: Stdio (Claude Desktop only)
+
+Claude Desktop launches and manages the server process directly. No separate terminal needed.
+
+Go to `Settings > Developer > Edit Config` and add:
 
 ```json
 {
@@ -23,91 +114,86 @@ Add to your Claude Desktop MCP config (`Settings > Developer > Edit Config`):
 
 Restart Claude Desktop. Done.
 
-### 2. Install the Chrome extension
+> **Note:** Stdio mode only supports one client at a time. If you need to connect from Cowork, Claude Code, or multiple clients, use the HTTP server instead.
 
-The extension is what lets Neo access your browser sessions.
+---
 
-1. `git clone https://github.com/heydryft/neo-mcp.git`
-2. Open `chrome://extensions`
-3. Enable **Developer mode** (top right)
-4. Click **Load unpacked** → select the `extension/` folder
+## What You Can Do
 
-The Neo Bridge icon appears in your toolbar. It auto-connects to the MCP server.
+Once installed, tell Claude to extract your auth tokens, then start using your accounts.
 
-## What you can do
+### LinkedIn
 
-### Use your LinkedIn
-
-Tell Claude: *"Extract my LinkedIn auth and get my recent posts with engagement metrics"*
+> *"Extract my LinkedIn auth and get my recent posts with engagement metrics"*
 
 | Tool | What it does |
-|------|-------------|
-| `linkedin_profile` | Get a user's profile |
+|------|---|
+| `linkedin_profile` | Get any user's profile |
 | `linkedin_my_posts` | Your posts with likes, comments, reposts, impressions |
 | `linkedin_feed` | Your feed |
 | `linkedin_post` | Create a post |
 | `linkedin_search` | Search for people |
 | `linkedin_connections` | List your connections |
 
-### Use your Twitter/X
+### Twitter/X
 
-Tell Claude: *"Extract my Twitter auth and show me my recent tweets"*
+> *"Extract my Twitter auth and show me my recent tweets"*
 
-Bearer token and GraphQL query IDs are extracted automatically from Twitter's JS bundle at runtime — they rotate with every deployment, so they can't be hardcoded.
+Bearer tokens and GraphQL query IDs are extracted automatically from Twitter's JS bundle — they rotate on every deploy so they can't be hardcoded.
 
 | Tool | What it does |
-|------|-------------|
-| `twitter_profile` | Get a user's profile |
-| `twitter_user_tweets` | A user's tweets with engagement |
+|------|---|
+| `twitter_profile` | Get any user's profile |
+| `twitter_user_tweets` | A user's tweets with engagement stats |
 | `twitter_timeline` | Your home timeline |
-| `twitter_post` | Post a tweet (or reply) |
+| `twitter_post` | Post a tweet or reply |
 | `twitter_search` | Search tweets |
 
-### Use your WhatsApp
+### WhatsApp
 
-Tell Claude: *"Connect to WhatsApp"* → scan QR code → done forever.
+> *"Connect to WhatsApp"* → scan the QR code → connected forever
 
 | Tool | What it does |
-|------|-------------|
+|------|---|
 | `whatsapp_connect` | Connect via QR code (first time) or auto-reconnect |
 | `whatsapp_chats` | List chats with last message + unread count |
 | `whatsapp_read` | Read messages by chat ID, phone number, or contact name |
 | `whatsapp_send` | Send a message |
 
-### Use ANY website you're logged into
+### Any Website You're Logged Into
 
-These three tools work on any site — no pre-built integration needed:
+No pre-built integration needed — these work on any site:
 
 | Tool | What it does |
-|------|-------------|
-| `extract_auth` | Grab auth tokens from any logged-in browser session (Slack, Discord, GitHub, Notion, Salesforce, anything) |
+|------|---|
+| `extract_auth` | Grab auth tokens from any logged-in session (Slack, Discord, GitHub, Notion, Salesforce, anything) |
 | `authenticated_fetch` | Make HTTP requests carrying the browser's cookies/auth |
 | `discover_api` | Capture network traffic to find a site's API endpoints |
 
-### Build new integrations on the fly
+### Build New Integrations On The Fly
 
 Tell Claude: *"Build me a Notion integration"* and it will:
 
 1. `extract_auth("notion")` — grab your Notion token from Chrome
 2. `discover_api(start, navigate: "notion.so")` — capture Notion's API traffic
 3. `discover_api(list)` — see all the endpoints
-4. `create_tool(...)` — write JavaScript implementations and register them as real MCP tools
+4. `create_tool(...)` — write a JavaScript tool and register it as a real MCP tool
 
-Those tools are available immediately and persist across restarts.
-
-| Tool | What it does |
-|------|-------------|
-| `create_tool` | Create a new MCP tool with JavaScript. Available immediately + persists. |
-| `list_custom_tools` | List all tools the AI has created |
-| `get_tool_code` | View a custom tool's source code |
-| `delete_tool` | Delete a custom tool |
-
-### Store structured data
-
-The AI can create its own database tables to store anything it collects.
+Custom tools are available immediately and persist across restarts.
 
 | Tool | What it does |
-|------|-------------|
+|------|---|
+| `create_tool` | Create a new MCP tool with JavaScript |
+| `list_custom_tools` | List all AI-created tools |
+| `get_tool_code` | View a custom tool's source |
+| `delete_tool` | Remove a custom tool |
+
+### Structured Data Storage
+
+Claude can create its own database tables to store anything it collects.
+
+| Tool | What it does |
+|------|---|
 | `collection_create` | Create a table with custom schema + full-text search |
 | `collection_insert` | Insert a row |
 | `collection_query` | Query with FTS, filters, ordering, pagination |
@@ -115,68 +201,55 @@ The AI can create its own database tables to store anything it collects.
 | `collection_delete` | Delete a row by ID |
 | `collection_list` | List all collections |
 
-## Transport modes
+### Multi-Profile Support
 
-Neo MCP supports two transports:
+Use multiple accounts for the same service:
 
-### Stdio (default — Claude Desktop)
+> *"Extract my LinkedIn auth as 'business'"*
+> *"Extract my LinkedIn auth as 'personal'"*
+> *"Get my posts using the business profile"*
 
-```
-Claude Desktop ←→ Neo MCP Server (stdio) ←→ WebSocket Bridge ←→ Chrome Extension
-                         ↓
-                    SQLite DB (~/.neo-mcp/)
-              (credentials, collections, custom tools)
-```
+Credentials are stored per profile — switch between them by name.
 
-This is the default. Just add Neo to your Claude Desktop config as shown above.
+---
 
-### HTTP (Cowork / remote clients)
+## Architecture
 
 ```
-Cowork VM / Client ──HTTP──→ Neo MCP Server (http://0.0.0.0:3100/mcp)
-                                    ↕ WebSocket
-                              Chrome Extension
+Claude (Desktop / Code / Cowork)
+          │
+     stdio or HTTP
+          │
+    Neo MCP Server ──── SQLite DB (~/.neo-mcp/)
+          │              (credentials, collections, custom tools)
+     WebSocket
+          │
+    Chrome Extension ── Your Browser Sessions
+                        (LinkedIn, Twitter, Slack, etc.)
 ```
 
-Start the server in HTTP mode on your **host machine**:
+1. The **Chrome extension** extracts auth tokens from your logged-in browser sessions and makes authenticated requests on your behalf
+2. The **MCP server** uses those tokens to call service APIs (LinkedIn, Twitter) or proxies requests through the browser
+3. **Custom tools** are stored in SQLite and reloaded on every startup
+4. **WhatsApp** uses Baileys (multi-device protocol) — connects once via QR, then persists
 
-```bash
-# From the neo-mcp directory on your machine (not inside Cowork)
-NEO_TRANSPORT=http node dist/server.js
-```
+After initial token extraction, LinkedIn and Twitter work without the browser open. WhatsApp maintains its own persistent connection.
 
-Or with a custom port:
+---
 
-```bash
-NEO_TRANSPORT=http NEO_HTTP_PORT=4000 node dist/server.js
-```
+## Troubleshooting
 
-You can also use the `--http` flag:
+**Extension not connecting?**
+The extension connects to the MCP server via WebSocket on `localhost:7890`. Make sure the server is running and no firewall is blocking local connections.
 
-```bash
-node dist/server.js --http
-```
+**`npm run build` fails?**
+`better-sqlite3` requires native compilation. Make sure you have build tools installed:
+- macOS: `xcode-select --install`
+- Windows: `npm install -g windows-build-tools`
+- Linux: `sudo apt install build-essential python3`
 
-The server exposes a Streamable HTTP MCP endpoint at `http://localhost:3100/mcp` (or your custom port).
-
-#### Cowork setup
-
-Cowork runs in a sandboxed Linux VM on your machine. To use Neo MCP with Cowork:
-
-1. Run `NEO_TRANSPORT=http node dist/server.js` in a terminal on your **host machine** (Windows/Mac)
-2. Make sure the Chrome extension is installed and connected
-3. Add Neo as a remote MCP server in your Claude/Cowork config pointing to `http://localhost:3100/mcp`
-
-> **Note:** The server must run on your host machine, not inside the Cowork VM, because it needs access to the Chrome extension (WebSocket bridge on localhost:7890) and the SQLite database with native bindings.
-
-## How it works
-
-1. The **Chrome extension** extracts auth tokens from your logged-in browser sessions and can make authenticated HTTP requests on your behalf
-2. The **MCP server** uses those tokens to call service APIs directly (LinkedIn, Twitter) or proxies requests through the browser (authenticated_fetch)
-3. **Custom tools** the AI creates are stored in SQLite and loaded on every startup
-4. **WhatsApp** uses Baileys (multi-device protocol) — connects once via QR, persists session to disk
-
-After initial token extraction, LinkedIn and Twitter work without the browser open. WhatsApp runs its own persistent connection.
+**Tokens not extracting?**
+Make sure you're logged into the service in Chrome, then ask Claude to `extract_auth("service_name")`. The extension needs to be loaded and active.
 
 ## License
 
