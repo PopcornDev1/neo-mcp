@@ -23,7 +23,7 @@ export function setBrowserCommand(fn: (method: string, params: Record<string, an
 async function linkedinApi<T = any>(
     auth: LinkedInAuth,
     path: string,
-    options: { method?: string; body?: any; params?: Record<string, string> } = {}
+    options: { method?: string; body?: any; params?: Record<string, string>; headers?: Record<string, string> } = {}
 ): Promise<T> {
     const url = new URL(`${VOYAGER}${path}`);
     if (options.params) {
@@ -35,6 +35,7 @@ async function linkedinApi<T = any>(
         "x-restli-protocol-version": "2.0.0",
         "x-li-lang": "en_US",
         "Accept": "application/vnd.linkedin.normalized+json+2.1",
+        ...(options.headers || {}),
     };
 
     if (options.body) {
@@ -78,13 +79,28 @@ async function linkedinApi<T = any>(
     return response.json() as Promise<T>;
 }
 
-/** Get the authenticated user's mini-profile (objectUrn, name) */
-async function getMe(auth: LinkedInAuth): Promise<{ objectUrn: string; entityUrn: string }> {
+/** Get the authenticated user's identity (URNs + miniProfile ID) */
+async function getMe(auth: LinkedInAuth): Promise<{ objectUrn: string; entityUrn: string; miniProfileId: string }> {
     const data = await linkedinApi(auth, `/me`);
     const profile = data.miniProfile || data;
+
+    // Extract fs_miniProfile ID from included entities (needed for newer GraphQL APIs)
+    let miniProfileId = "";
+    if (data.included) {
+        for (const item of data.included) {
+            if (item.entityUrn?.includes("fs_miniProfile")) {
+                miniProfileId = item.entityUrn.replace("urn:li:fs_miniProfile:", "");
+                break;
+            }
+        }
+    }
+    // Fallback: plainId field (some response formats provide this directly)
+    if (!miniProfileId) miniProfileId = data.plainId || profile.plainId || "";
+
     return {
         objectUrn: profile.objectUrn || "",
         entityUrn: profile.entityUrn || profile.objectUrn || "",
+        miniProfileId,
     };
 }
 
@@ -135,7 +151,6 @@ export async function getMyPosts(auth: LinkedInAuth, count = 20): Promise<any[]>
         q: "memberShareFeed",
         moduleKey: "memberShareFeed",
         start: "0",
-        paginationToken: "",
     };
     if (memberUrn) params.memberUrn = memberUrn;
 
@@ -150,7 +165,6 @@ export async function getFeed(auth: LinkedInAuth, count = 20): Promise<any[]> {
             count: String(count),
             q: "relevance",
             start: "0",
-            paginationToken: "",
         },
     });
 
@@ -342,63 +356,113 @@ export async function getConnections(auth: LinkedInAuth, count = 50): Promise<an
 
 // ── Messaging ────────────────────────────────────────────────────────────────
 
-/** List recent message conversations */
-export async function getConversations(auth: LinkedInAuth, count = 20): Promise<any[]> {
-    const data = await linkedinApi(auth, `/messaging/conversations`, {
+/** List recent message conversations via LinkedIn's GraphQL messaging API */
+export async function getConversations(auth: LinkedInAuth, count = 20): Promise<any> {
+    // Get miniProfile ID needed for mailbox URN
+    const me = await getMe(auth);
+    const profileId = me.miniProfileId || me.entityUrn?.replace(/.*:/, "") || "";
+    if (!profileId) throw new Error("Could not determine profile ID for messaging");
+
+    const mailboxUrn = `urn:li:fsd_profile:${profileId}`;
+
+    // Use LinkedIn's GraphQL messaging endpoint (same as web UI)
+    const data = await linkedinApi(auth, `/voyagerMessagingGraphQL/graphql`, {
         params: {
-            keyVersion: "LEGACY_INBOX",
-            count: String(count),
-            start: "0",
+            queryId: "messengerConversations.0d5e6781bbee71c3e51c8843c6519f48",
+            variables: `(mailboxUrn:${mailboxUrn})`,
         },
+        headers: { "Accept": "application/graphql" },
     });
 
-    const included: any[] = data.included || [];
-    const elements: any[] = data.elements || [];
-
-    // Build URN lookup for participant mini-profiles
-    const byUrn = new Map<string, any>();
-    for (const item of included) {
-        const urn = item.entityUrn || item["*miniProfile"];
-        if (urn) byUrn.set(urn, item);
+    // GraphQL response has deeply nested conversation objects — walk the tree to find them
+    const conversations: any[] = [];
+    function findConversations(obj: any, depth: number) {
+        if (!obj || typeof obj !== "object" || depth > 6) return;
+        if (Array.isArray(obj)) { obj.forEach((i: any) => findConversations(i, depth + 1)); return; }
+        if (obj.elements && Array.isArray(obj.elements)) {
+            for (const el of obj.elements) {
+                if (el._type === "com.linkedin.messenger.Conversation" || el.conversationParticipants || el.lastActivityAt) {
+                    conversations.push(el);
+                }
+            }
+        }
+        for (const k of Object.keys(obj)) {
+            if (typeof obj[k] === "object" && obj[k] !== null) findConversations(obj[k], depth + 1);
+        }
     }
+    findConversations(data, 0);
 
-    return elements.slice(0, count).map((conv: any) => {
-        // Extract participant names from included mini-profiles
-        const participantUrns: string[] = conv["*participants"] || [];
-        const participants = participantUrns.map((pUrn: string) => {
-            const participant = byUrn.get(pUrn);
-            if (!participant) return pUrn;
-            const mp = participant.miniProfile || participant["*miniProfile"];
-            const profile = mp ? (typeof mp === "string" ? byUrn.get(mp) : mp) : participant;
-            if (profile?.firstName) return `${profile.firstName} ${profile.lastName || ""}`.trim();
-            return participant.firstName ? `${participant.firstName} ${participant.lastName || ""}`.trim() : pUrn;
-        });
+    const myUrn = mailboxUrn;
+    const results = conversations.slice(0, count).map((conv: any) => {
+        // Extract participants (excluding self)
+        const participants: any[] = [];
+        for (const p of (conv.conversationParticipants || [])) {
+            const member = p.participantType?.member;
+            if (!member) continue;
+            if (p.hostIdentityUrn === myUrn) continue;
+            const name = [member.firstName?.text || "", member.lastName?.text || ""].filter(Boolean).join(" ");
+            participants.push({
+                name,
+                headline: member.headline?.text || "",
+                profileUrl: member.profileUrl || "",
+            });
+        }
 
-        const lastEvent = conv.events?.[0] || {};
-        const msgBody = lastEvent.eventContent?.attributedBody?.text
-            || lastEvent.eventContent?.body
-            || lastEvent.subtype
-            || "";
+        // Extract last message
+        const msgs = conv.messages?.elements || [];
+        const lastMsg = msgs[0] || {};
+        const msgText = lastMsg.body?.text || "";
+        const senderMember = lastMsg.actor?.participantType?.member;
+        const senderName = senderMember
+            ? [senderMember.firstName?.text || "", senderMember.lastName?.text || ""].filter(Boolean).join(" ")
+            : "";
+
+        // Extract a usable conversation ID for getConversationMessages
+        // conversationUrl looks like "https://www.linkedin.com/messaging/thread/2-YWJj..."
+        const convUrl = conv.conversationUrl || "";
+        let conversationId = conv.entityUrn || conv.backendConversationUrn || "";
+        if (!conversationId && convUrl) {
+            const threadMatch = convUrl.match(/\/thread\/([^/?]+)/);
+            if (threadMatch) conversationId = threadMatch[1];
+        }
 
         return {
-            conversationId: conv.entityUrn || conv.backendConversationUrn || "",
-            participants,
-            lastMessage: msgBody.slice(0, 300),
+            conversationId,
+            conversationUrl: convUrl,
+            participants: participants.length > 0 ? participants : [{ name: "Unknown" }],
+            lastMessage: msgText.slice(0, 500),
+            lastMessageFrom: senderName,
             lastActivityAt: conv.lastActivityAt ? new Date(conv.lastActivityAt).toISOString() : null,
             unreadCount: conv.unreadCount || 0,
+            read: conv.read || false,
+            categories: conv.categories || [],
+            subject: lastMsg.subject || null,
         };
     });
+
+    if (results.length === 0) {
+        return { note: "No conversations found", raw: JSON.stringify(data).slice(0, 2000) };
+    }
+
+    return { totalCount: results.length, conversations: results };
 }
 
 /** Get messages in a specific conversation */
 export async function getConversationMessages(auth: LinkedInAuth, conversationId: string, count = 20): Promise<any[]> {
     // conversationId can be:
-    //   - Full URN: "urn:li:fs_conversation:2-YWJj..." → extract after last known prefix
+    //   - Full URL: "https://www.linkedin.com/messaging/thread/2-YWJj..."
+    //   - Full URN: "urn:li:fs_conversation:2-YWJj..."
     //   - Thread ID: "2-YWJj..." (already just the ID)
-    // The API expects the thread ID, not the full URN.
     let convId = conversationId;
+
+    // Extract from URL
+    if (convId.includes("/messaging/thread/")) {
+        const match = convId.match(/\/thread\/([^/?]+)/);
+        if (match) convId = match[1];
+    }
+
+    // Strip known URN prefixes
     if (convId.startsWith("urn:li:")) {
-        // Strip "urn:li:fs_conversation:" or similar prefix
         const prefixes = ["urn:li:fs_conversation:", "urn:li:msg_conversation:", "urn:li:messagingThread:"];
         for (const prefix of prefixes) {
             if (convId.startsWith(prefix)) {
@@ -463,9 +527,6 @@ export async function sendMessage(auth: LinkedInAuth, recipientUrn: string, body
             throw new Error(`Could not resolve member URN for "${recipientUrn}"`);
         }
     }
-
-    const me = await getMe(auth);
-    const senderUrn = me.entityUrn || me.objectUrn;
 
     const msgBody = {
         keyVersion: "LEGACY_INBOX",
@@ -608,7 +669,6 @@ export async function getNotifications(auth: LinkedInAuth, count = 20): Promise<
     });
 
     const elements: any[] = data.elements || [];
-    const included: any[] = data.included || [];
 
     return elements.slice(0, count).map((n: any) => ({
         headline: n.headline?.text || n.headline || "",
@@ -641,7 +701,7 @@ export async function sendConnectionRequest(auth: LinkedInAuth, vanityName: stri
         body.customMessage = message;
     }
 
-    const result = await linkedinApi(auth, `/relationships/invitations`, {
+    await linkedinApi(auth, `/relationships/invitations`, {
         method: "POST",
         body,
     });
