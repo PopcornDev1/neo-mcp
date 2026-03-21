@@ -25,9 +25,16 @@ async function linkedinApi<T = any>(
     path: string,
     options: { method?: string; body?: any; params?: Record<string, string>; headers?: Record<string, string> } = {}
 ): Promise<T> {
-    const url = new URL(`${VOYAGER}${path}`);
+    // Build query string without URL.searchParams — LinkedIn's GraphQL API requires
+    // specific encoding: parentheses/colons/commas unencoded in variables syntax,
+    // but URN colons encoded. Since all params are code-generated (not user input),
+    // we pass them raw and let callers pre-encode URN values where needed.
+    let urlStr = `${VOYAGER}${path}`;
     if (options.params) {
-        for (const [k, v] of Object.entries(options.params)) url.searchParams.set(k, v);
+        const qs = Object.entries(options.params)
+            .map(([k, v]) => `${k}=${v}`)
+            .join("&");
+        urlStr += `?${qs}`;
     }
 
     // csrf-token must be "ajax:{JSESSIONID}" — normalize if needed
@@ -50,7 +57,7 @@ async function linkedinApi<T = any>(
     // Route through browser extension — carries real browser TLS fingerprint
     if (_browserCommand) {
         const result = await _browserCommand("browser_fetch", {
-            url: url.toString(),
+            url: urlStr,
             method: options.method || "GET",
             headers,
             body: options.body ? JSON.stringify(options.body) : undefined,
@@ -70,7 +77,7 @@ async function linkedinApi<T = any>(
     headers["Cookie"] = `li_at=${auth.li_at}; JSESSIONID="${auth.jsessionid}"`;
     headers["User-Agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
-    const response = await fetch(url.toString(), {
+    const response = await fetch(urlStr, {
         method: options.method || "GET",
         headers,
         body: options.body ? JSON.stringify(options.body) : undefined,
@@ -318,9 +325,19 @@ function extractGraphQLFeedPosts(data: any, max: number): any[] {
             "";
         const authorUrn = actor.urn || actor["*actor"] || "";
 
-        // Social counts
+        // Social counts — may be embedded or referenced in included entities
         const socialDetail: any = component.socialDetail || component.threadSocialDetail || {};
-        const socialCounts: any = socialDetail.totalSocialActivityCounts || {};
+        let socialCounts: any = socialDetail.totalSocialActivityCounts || {};
+
+        // If counts are zero, look up from included fsd_socialActivityCounts entities
+        if (!socialCounts.numLikes && !socialCounts.numComments) {
+            const activityUrn = component.updateMetadata?.backendUrn || "";
+            if (activityUrn) {
+                const countsUrn = `urn:li:fsd_socialActivityCounts:${activityUrn}`;
+                const countsEntity = byUrn.get(countsUrn);
+                if (countsEntity) socialCounts = countsEntity;
+            }
+        }
 
         // Post URN — prefer the activity URN embedded in the feed component
         const postUrn =
@@ -389,87 +406,76 @@ export async function createPost(auth: LinkedInAuth, text: string): Promise<any>
     return { posted: true, urn: data.urn || data.value?.urn };
 }
 
-/** Search for people */
+/** Search for people via GraphQL search endpoint */
 export async function searchPeople(auth: LinkedInAuth, query: string, count = 10): Promise<any[]> {
-    // /search/dash/clusters returns 400 — try typeahead first
-    try {
-        const data = await linkedinApi(auth, `/typeahead/hitsV2`, {
-            params: {
-                q: "people",
-                keywords: query,
-                count: String(count),
-                origin: "GLOBAL_SEARCH_HEADER",
-            },
-        });
-        const hits: any[] = data.elements || data.included || [];
-        const results = hits
-            .filter((e: any) => e.firstName || e.title?.text || e.hitInfo)
-            .slice(0, count)
-            .map((p: any) => {
-                const hit = p.hitInfo?.["com.linkedin.voyager.search.BlendedSearchHit"] || p;
-                const entity = hit.targetPageInstance || hit;
-                return {
-                    name:
-                        p.title?.text ||
-                        entity.title?.text ||
-                        `${entity.firstName || p.firstName || ""} ${entity.lastName || p.lastName || ""}`.trim(),
-                    headline:
-                        p.headline?.text ||
-                        entity.headline?.text ||
-                        p.primarySubtitle?.text ||
-                        "",
-                    publicId: entity.publicIdentifier || p.publicIdentifier || "",
-                    location: p.subline?.text || entity.location?.defaultLocalizedName || "",
-                };
-            })
-            .filter((p: any) => p.name);
-        if (results.length > 0) return results;
-    } catch {}
-
-    // Fallback: original endpoint (may return 400 on some accounts)
-    const data = await linkedinApi(auth, `/search/dash/clusters`, {
+    // Encode the query for use in URL (spaces → %20, etc.) but keep GraphQL syntax raw
+    const encodedQuery = encodeURIComponent(query);
+    const data = await linkedinApi(auth, `/graphql`, {
         params: {
-            origin: "GLOBAL_SEARCH_HEADER",
-            q: "all",
-            keywords: query,
-            resultType: "PEOPLE",
-            count: String(count),
-            start: "0",
+            variables: `(start:0,origin:GLOBAL_SEARCH_HEADER,query:(keywords:${encodedQuery},flagshipSearchIntent:SEARCH_SRP,queryParameters:List((key:resultType,value:List(PEOPLE))),includeFiltersInResponse:false))`,
+            queryId: "voyagerSearchDashClusters.b0928897b71bd00a5a7291755dcd64f0",
         },
     });
 
-    const included = data.included || [];
-    return included
-        .filter((e: any) => e.firstName || e.title?.text)
-        .slice(0, count)
-        .map((p: any) => ({
-            name: p.title?.text || `${p.firstName} ${p.lastName}`,
-            headline: p.headline?.text || p.headline || "",
-            publicId: p.publicIdentifier || "",
-            location: p.subline?.text || "",
-        }));
+    const included: any[] = data?.included || [];
+    const results: any[] = [];
+
+    for (const item of included) {
+        if (results.length >= count) break;
+        // EntityResultViewModel contains search result data (name, headline, location)
+        const isResult = item.$type?.includes("EntityResultViewModel") || item.title?.text;
+        if (!isResult || !item.title?.text) continue;
+
+        // Extract vanity name from navigationUrl
+        let publicId = "";
+        const navUrl = item.navigationUrl || item.navigationContext?.url || "";
+        const match = navUrl.match(/\/in\/([^?/]+)/);
+        if (match) publicId = match[1];
+
+        results.push({
+            name: item.title?.text || "",
+            headline: item.primarySubtitle?.text || "",
+            publicId,
+            location: item.secondarySubtitle?.text || "",
+        });
+    }
+
+    return results;
 }
 
-/** Get connections */
+/** Get connections — returns connected member URNs with timestamps.
+ *  Profile details (name, headline) require the GraphQL search endpoint. */
 export async function getConnections(auth: LinkedInAuth, count = 50): Promise<any[]> {
-    const data = await linkedinApi(auth, `/relationships/dash/connections`, {
+    // Use GraphQL search to find connections (network filter: F = first-degree)
+    const data = await linkedinApi(auth, `/graphql`, {
         params: {
-            count: String(count),
-            q: "search",
-            sortType: "RECENTLY_ADDED",
-            start: "0",
+            variables: `(start:0,origin:MEMBER_PROFILE_CANNED_SEARCH,query:(flagshipSearchIntent:SEARCH_SRP,queryParameters:List((key:network,value:List(F)),(key:resultType,value:List(PEOPLE))),includeFiltersInResponse:false))`,
+            queryId: "voyagerSearchDashClusters.b0928897b71bd00a5a7291755dcd64f0",
         },
     });
 
-    const included = data.included || [];
-    return included
-        .filter((e: any) => e.firstName)
-        .slice(0, count)
-        .map((c: any) => ({
-            name: `${c.firstName} ${c.lastName}`,
-            headline: c.headline || "",
-            publicId: c.publicIdentifier || "",
-        }));
+    const included: any[] = data?.included || [];
+    const results: any[] = [];
+
+    for (const item of included) {
+        if (results.length >= count) break;
+        const isResult = item.$type?.includes("EntityResultViewModel") || (item.title?.text && item.primarySubtitle?.text);
+        if (!isResult || !item.title?.text) continue;
+
+        let publicId = "";
+        const navUrl = item.navigationUrl || item.navigationContext?.url || "";
+        const match = navUrl.match(/\/in\/([^?/]+)/);
+        if (match) publicId = match[1];
+
+        results.push({
+            name: item.title?.text || "",
+            headline: item.primarySubtitle?.text || "",
+            publicId,
+            location: item.secondarySubtitle?.text || "",
+        });
+    }
+
+    return results;
 }
 
 // ── Messaging ────────────────────────────────────────────────────────────────
@@ -481,7 +487,8 @@ export async function getConversations(auth: LinkedInAuth, count = 20): Promise<
     const profileId = me.miniProfileId || me.entityUrn?.replace(/.*:/, "") || "";
     if (!profileId) throw new Error("Could not determine profile ID for messaging");
 
-    const mailboxUrn = `urn:li:fsd_profile:${profileId}`;
+    // URN colons must be percent-encoded in messaging GraphQL variables
+    const mailboxUrn = `urn%3Ali%3Afsd_profile%3A${profileId}`;
 
     // Use LinkedIn's GraphQL messaging endpoint (same as web UI)
     const data = await linkedinApi(auth, `/voyagerMessagingGraphQL/graphql`, {
@@ -489,14 +496,32 @@ export async function getConversations(auth: LinkedInAuth, count = 20): Promise<
             queryId: "messengerConversations.0d5e6781bbee71c3e51c8843c6519f48",
             variables: `(mailboxUrn:${mailboxUrn})`,
         },
-        headers: { "Accept": "application/graphql" },
+        headers: { "Accept": "application/json" },
     });
+
+    // Response may be a JSON string (application/graphql content type) — parse if needed.
+    // Sanitize control characters that can appear in LinkedIn message bodies.
+    let parsed = data;
+    if (typeof data === "string") {
+        // Replace unescaped control characters (except already-escaped sequences)
+        // with their Unicode escape form for safe JSON parsing
+        const sanitized = data.replace(/[\x00-\x1f\x7f]/g, (ch: string) => {
+            if (ch === "\n" || ch === "\r" || ch === "\t") return ch;
+            return "\\u" + ch.charCodeAt(0).toString(16).padStart(4, "0");
+        });
+        parsed = JSON.parse(sanitized);
+    }
 
     // GraphQL response has deeply nested conversation objects — walk the tree to find them
     const conversations: any[] = [];
     function findConversations(obj: any, depth: number) {
-        if (!obj || typeof obj !== "object" || depth > 6) return;
+        if (!obj || typeof obj !== "object" || depth > 8) return;
         if (Array.isArray(obj)) { obj.forEach((i: any) => findConversations(i, depth + 1)); return; }
+        // Direct match: object is a conversation
+        if (obj._type === "com.linkedin.messenger.Conversation" && obj.conversationParticipants) {
+            conversations.push(obj);
+            return;
+        }
         if (obj.elements && Array.isArray(obj.elements)) {
             for (const el of obj.elements) {
                 if (el._type === "com.linkedin.messenger.Conversation" || el.conversationParticipants || el.lastActivityAt) {
@@ -508,36 +533,45 @@ export async function getConversations(auth: LinkedInAuth, count = 20): Promise<
             if (typeof obj[k] === "object" && obj[k] !== null) findConversations(obj[k], depth + 1);
         }
     }
-    findConversations(data, 0);
+    findConversations(parsed, 0);
 
-    const myUrn = mailboxUrn;
+    // Decode the mailbox URN for self-filtering (was percent-encoded for the API call)
+    const myUrn = `urn:li:fsd_profile:${profileId}`;
     const results = conversations.slice(0, count).map((conv: any) => {
         // Extract participants (excluding self)
         const participants: any[] = [];
         for (const p of (conv.conversationParticipants || [])) {
-            const member = p.participantType?.member;
-            if (!member) continue;
             if (p.hostIdentityUrn === myUrn) continue;
-            const name = [member.firstName?.text || "", member.lastName?.text || ""].filter(Boolean).join(" ");
-            participants.push({
-                name,
-                headline: member.headline?.text || "",
-                profileUrl: member.profileUrl || "",
-            });
+            const member = p.participantType?.member;
+            const org = p.participantType?.organization;
+            if (member) {
+                const name = [member.firstName?.text || "", member.lastName?.text || ""].filter(Boolean).join(" ");
+                participants.push({
+                    name,
+                    headline: member.headline?.text || "",
+                    profileUrl: member.profileUrl || "",
+                });
+            } else if (org) {
+                participants.push({
+                    name: org.name?.text || "Organization",
+                    headline: org.tagline || "",
+                    profileUrl: org.pageUrl || "",
+                });
+            }
         }
 
-        // Extract last message
-        const msgs = conv.messages?.elements || [];
+        // Extract last message — may be in conv.messages.elements or contentMetadata.messages.elements
+        const msgs = conv.messages?.elements || conv.contentMetadata?.messages?.elements || [];
         const lastMsg = msgs[0] || {};
         const msgText = lastMsg.body?.text || "";
         const senderMember = lastMsg.actor?.participantType?.member;
+        const senderOrg = lastMsg.actor?.participantType?.organization;
         const senderName = senderMember
             ? [senderMember.firstName?.text || "", senderMember.lastName?.text || ""].filter(Boolean).join(" ")
-            : "";
+            : senderOrg?.name?.text || "";
 
         // Extract a usable conversation ID for getConversationMessages
-        // conversationUrl looks like "https://www.linkedin.com/messaging/thread/2-YWJj..."
-        const convUrl = conv.conversationUrl || "";
+        const convUrl = conv.conversationUrl || conv.contentMetadata?.conversationUrl || "";
         let conversationId = conv.entityUrn || conv.backendConversationUrn || "";
         if (!conversationId && convUrl) {
             const threadMatch = convUrl.match(/\/thread\/([^/?]+)/);
@@ -559,7 +593,7 @@ export async function getConversations(auth: LinkedInAuth, count = 20): Promise<
     });
 
     if (results.length === 0) {
-        return { note: "No conversations found", raw: JSON.stringify(data).slice(0, 2000) };
+        return { note: "No conversations found", raw: JSON.stringify(parsed).slice(0, 2000) };
     }
 
     return { totalCount: results.length, conversations: results };
@@ -583,23 +617,36 @@ export async function getConversationMessages(auth: LinkedInAuth, conversationId
     if (!convUrn.startsWith("urn:li:")) {
         convUrn = `urn:li:msg_conversation:(${convUrn})`;
     } else if (convUrn.startsWith("urn:li:fs_conversation:")) {
-        // Convert fs_conversation → msg_conversation wrapper
         const id = convUrn.replace("urn:li:fs_conversation:", "");
         convUrn = `urn:li:msg_conversation:(${id})`;
-    }
-    // urn:li:msg_conversation:xxx can be passed directly, urn:li:messagingThread:xxx → wrap
-    else if (convUrn.startsWith("urn:li:messagingThread:")) {
+    } else if (convUrn.startsWith("urn:li:messagingThread:")) {
         const id = convUrn.replace("urn:li:messagingThread:", "");
         convUrn = `urn:li:msg_conversation:(${id})`;
     }
 
+    // Percent-encode colons in URN for messaging GraphQL variables
+    const encodedConvUrn = convUrn.replace(/:/g, "%3A");
+
     const data = await linkedinApi(auth, `/voyagerMessagingGraphQL/graphql`, {
         params: {
             queryId: "messengerMessages.5846eeb71c981f11e0134cb6626cc314",
-            variables: `(conversationUrn:${convUrn})`,
+            variables: `(conversationUrn:${encodedConvUrn})`,
         },
-        headers: { "Accept": "application/graphql" },
+        headers: { "Accept": "application/json" },
     });
+
+    // Response may be a JSON string (application/graphql content type) — parse if needed.
+    // Sanitize control characters that can appear in message bodies.
+    let parsed = data;
+    if (typeof data === "string") {
+        // Replace unescaped control characters (except already-escaped sequences)
+        // with their Unicode escape form for safe JSON parsing
+        const sanitized = data.replace(/[\x00-\x1f\x7f]/g, (ch: string) => {
+            if (ch === "\n" || ch === "\r" || ch === "\t") return ch;
+            return "\\u" + ch.charCodeAt(0).toString(16).padStart(4, "0");
+        });
+        parsed = JSON.parse(sanitized);
+    }
 
     // Walk the GraphQL response tree to find message objects
     const messages: any[] = [];
@@ -618,7 +665,7 @@ export async function getConversationMessages(auth: LinkedInAuth, conversationId
             if (typeof obj[k] === "object" && obj[k] !== null) findMessages(obj[k], depth + 1);
         }
     }
-    findMessages(data, 0);
+    findMessages(parsed, 0);
 
     return messages.slice(0, count).map((msg: any) => {
         const senderMember =
@@ -796,29 +843,54 @@ export async function getNotifications(auth: LinkedInAuth, count = 20): Promise<
         },
     });
 
-    const elements: any[] = data.elements || [];
+    // Normalized response: elements may be in data.elements, data.data.elements, or included
+    const elements: any[] = data?.data?.elements || data?.elements || [];
+    const included: any[] = data?.included || [];
 
-    return elements.slice(0, count).map((n: any) => ({
-        headline:
+    // If elements are URN references, resolve from included
+    const byUrn = new Map<string, any>();
+    for (const item of included) {
+        const urn = item.entityUrn || item.urn;
+        if (urn) byUrn.set(urn, item);
+    }
+
+    const notifications: any[] = [];
+    const candidates = elements.length > 0 ? elements : included.filter((i: any) =>
+        i.$type?.includes("NotificationCard") || i.headline || i.headlineText
+    );
+
+    for (const raw of candidates) {
+        if (notifications.length >= count) break;
+        const n = typeof raw === "string" ? (byUrn.get(raw) || {}) : raw;
+        if (!n || Object.keys(n).length === 0) continue;
+
+        const headline =
             n.headline?.text ||
             n.headlineText?.text ||
             n.notificationText?.text ||
             n.headline ||
-            "",
-        description:
-            n.subText?.text ||
-            n.additionalDescription?.text ||
-            n.description?.text ||
-            "",
-        type: n.notificationType || n.trackingData?.notificationType || n.type || "",
-        read: !!n.read,
-        createdAt: n.publishedAt ? new Date(n.publishedAt).toISOString() : null,
-        actionUrl:
-            n.navigationUrl ||
-            n.cta?.navigationUrl ||
-            n.actions?.[0]?.actionTarget ||
-            "",
-    }));
+            "";
+        if (!headline) continue;
+
+        notifications.push({
+            headline,
+            description:
+                n.subText?.text ||
+                n.additionalDescription?.text ||
+                n.description?.text ||
+                "",
+            type: n.notificationType || n.trackingData?.notificationType || n.type || "",
+            read: !!n.read,
+            createdAt: n.publishedAt ? new Date(n.publishedAt).toISOString() : null,
+            actionUrl:
+                n.navigationUrl ||
+                n.cta?.navigationUrl ||
+                n.actions?.[0]?.actionTarget ||
+                "",
+        });
+    }
+
+    return notifications;
 }
 
 // ── Connection Requests ──────────────────────────────────────────────────────
