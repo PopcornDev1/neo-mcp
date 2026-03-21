@@ -447,12 +447,34 @@ server.tool(
 
 server.tool(
     "whatsapp_connect",
-    "Connect to WhatsApp. Returns a QR code to scan on first use. Auto-reconnects after that.",
+    "Connect to WhatsApp. Opens a QR code in the browser on first use. Auto-reconnects after that.",
     {},
     async () => {
         const wa = await import("./integrations/whatsapp.js");
-        await wa.connect();
-        return { content: [{ type: "text", text: "WhatsApp connected." }] };
+        const { state } = wa.getConnectionState();
+        if (state === "connected") return { content: [{ type: "text", text: "WhatsApp already connected." }] };
+
+        wa.connect().catch(() => {});
+
+        const deadline = Date.now() + 10000;
+        while (Date.now() < deadline) {
+            const s = wa.getConnectionState();
+            if (s.state === "connected") return { content: [{ type: "text", text: "WhatsApp connected." }] };
+            if (s.state === "qr" && s.qr) {
+                const qrUrl = `http://127.0.0.1:${httpPort}/whatsapp-qr`;
+                try { await browserCommand("navigate", { url: qrUrl }); } catch {}
+                const scanDeadline = Date.now() + 60000;
+                while (Date.now() < scanDeadline) {
+                    await new Promise(r => setTimeout(r, 2000));
+                    if (wa.getConnectionState().state === "connected") {
+                        return { content: [{ type: "text", text: "WhatsApp connected! QR code scanned successfully." }] };
+                    }
+                }
+                return { content: [{ type: "text", text: `QR code opened in browser at ${qrUrl}. Scan it with WhatsApp (Linked Devices > Link a Device), then call whatsapp_connect again.` }] };
+            }
+            await new Promise(r => setTimeout(r, 500));
+        }
+        return { content: [{ type: "text", text: `WhatsApp connection state: ${wa.getConnectionState().state}. Try again.` }] };
     }
 );
 
@@ -941,6 +963,24 @@ async function main() {
         res.status(200).end();
     });
 
+    // ── WhatsApp QR page ──────────────────────────────────────────────────
+    app.get("/whatsapp-qr", async (req, res) => {
+        const wa = await import("./integrations/whatsapp.js");
+        const { state, qr } = wa.getConnectionState();
+        const QRCode = (await import("qrcode")).default;
+        let body: string;
+        if (state === "connected") {
+            body = `<html><body style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:system-ui;background:#111;color:#fff"><h1>WhatsApp Connected &#x2705;</h1></body></html>`;
+        } else if (qr) {
+            const svg = await QRCode.toString(qr, { type: "svg", margin: 2 });
+            body = `<html><head><meta http-equiv="refresh" content="5"></head><body style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:system-ui;background:#111;color:#fff"><h2>Scan with WhatsApp</h2><p style="color:#aaa">Linked Devices &rarr; Link a Device</p><div style="background:white;padding:24px;border-radius:16px">${svg}</div><p style="color:#666;margin-top:16px">Auto-refreshing every 5s...</p></body></html>`;
+        } else {
+            body = `<html><head><meta http-equiv="refresh" content="3"></head><body style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:system-ui;background:#111;color:#fff"><h2>Connecting to WhatsApp... waiting for QR code</h2></body></html>`;
+        }
+        res.setHeader("Content-Type", "text/html");
+        res.send(body);
+    });
+
     app.listen(httpPort, "127.0.0.1", () => {
         console.error(`[neo-mcp] HTTP transport listening on http://127.0.0.1:${httpPort}/mcp`);
     });
@@ -1158,8 +1198,38 @@ function registerAllTools(s: McpServer) {
         async ({ name }) => { const deleted = db.deleteCustomTool(name); if (deleted) await server.server.sendToolListChanged(); return { content: [{ type: "text", text: deleted ? `Deleted "${name}".` : `Tool "${name}" not found.` }] }; });
 
     // WhatsApp
-    s.tool("whatsapp_connect", "Connect to WhatsApp. Returns a QR code to scan on first use. Auto-reconnects after that.", {},
-        async () => { const wa = await import("./integrations/whatsapp.js"); await wa.connect(); return { content: [{ type: "text", text: "WhatsApp connected." }] }; });
+    s.tool("whatsapp_connect", "Connect to WhatsApp. Opens a QR code in the browser on first use. Auto-reconnects after that.", {},
+        async () => {
+            const wa = await import("./integrations/whatsapp.js");
+            const { state } = wa.getConnectionState();
+            if (state === "connected") return { content: [{ type: "text", text: "WhatsApp already connected." }] };
+
+            // Start connecting (non-blocking — triggers QR generation)
+            wa.connect().catch(() => {});
+
+            // Wait briefly for QR or connection
+            const deadline = Date.now() + 10000;
+            while (Date.now() < deadline) {
+                const s = wa.getConnectionState();
+                if (s.state === "connected") return { content: [{ type: "text", text: "WhatsApp connected." }] };
+                if (s.state === "qr" && s.qr) {
+                    // Open QR page in browser via extension
+                    const qrUrl = `http://127.0.0.1:${httpPort}/whatsapp-qr`;
+                    try { await browserCommand("navigate", { url: qrUrl }); } catch {}
+                    // Now wait for the user to scan (up to 60s)
+                    const scanDeadline = Date.now() + 60000;
+                    while (Date.now() < scanDeadline) {
+                        await new Promise(r => setTimeout(r, 2000));
+                        if (wa.getConnectionState().state === "connected") {
+                            return { content: [{ type: "text", text: "WhatsApp connected! QR code scanned successfully." }] };
+                        }
+                    }
+                    return { content: [{ type: "text", text: `QR code opened in browser at ${qrUrl}. Scan it with WhatsApp (Linked Devices > Link a Device), then call whatsapp_connect again.` }] };
+                }
+                await new Promise(r => setTimeout(r, 500));
+            }
+            return { content: [{ type: "text", text: `WhatsApp connection state: ${wa.getConnectionState().state}. Try again.` }] };
+        });
     s.tool("whatsapp_chats", "List WhatsApp chats with last message and unread count.", { limit: z.number().optional() },
         async ({ limit }) => { const wa = await import("./integrations/whatsapp.js"); const chats = await wa.getChats(limit || 30); return { content: [{ type: "text", text: json(chats) }] }; });
     s.tool("whatsapp_read", "Read messages from a WhatsApp chat. Pass chat ID, phone number, or contact name.", { chat: z.string().describe("Chat ID, phone number (e.g. +919876543210), or contact name"), limit: z.number().optional() },

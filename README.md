@@ -96,26 +96,9 @@ Point it at `http://localhost:3100/mcp` — it speaks [Streamable HTTP](https://
 
 ---
 
-## Option B: Stdio (Claude Desktop only)
+## Option B: Stdio (deprecated)
 
-Claude Desktop launches and manages the server process directly. No separate terminal needed.
-
-Go to `Settings > Developer > Edit Config` and add:
-
-```json
-{
-  "mcpServers": {
-    "neo": {
-      "command": "npx",
-      "args": ["-y", "github:heydryft/neo-mcp"]
-    }
-  }
-}
-```
-
-Restart Claude Desktop. Done.
-
-> **Note:** Stdio mode only supports one client at a time. If you need to connect from Cowork, Claude Code, or multiple clients, use the HTTP server instead.
+> **Deprecated:** Stdio mode only supports one client at a time and lacks features like the WhatsApp QR flow. Use the HTTP server (Option A) instead.
 
 ---
 
